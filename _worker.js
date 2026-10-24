@@ -887,12 +887,8 @@ async function handleApi(request, env, path) {
       } catch (e) {
         return json({ error: "账号验证失败: " + (e && e.message) }, 400);
       }
-      if (accId === env.CF_ACCOUNT_ID && meta.hideBuiltin) {
-        // 添加的环境变量账号曾被"删除"(隐藏) → 恢复显示即可
-        meta.hideBuiltin = false;
-        await saveMeta(env, meta);
-        return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
-      }
+      // 环境变量默认账号被"删除"后, 再用同一个账户 ID 添加 → 按用户的自定义名字
+      // 存成普通账号 (和其它账号完全一样, 可改名可删除), 默认账号保持隐藏不改回来
       meta.accounts.push(Object.assign({ name, acc: accId }, auth));
       await saveMeta(env, meta);
       return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
@@ -1875,7 +1871,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <label>该账户的 Global API Key (全权限)</label>
     <input id="am_key" placeholder="My Profile → API Keys → Global API Key, 粘贴后点添加" autocapitalize="off" autocomplete="off" spellcheck="false">
     <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
-    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥只存 KV, 不会下发到页面。默认账号(环境变量)现在也可删除, 只用这里添加的账号; 想恢复就在此填回同一个账户 ID。</div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥只存 KV, 不会下发到页面。所有账号都可用自定名字, 也都可删除; 环境变量默认账号删除后就不再出现, 想继续用它就在此填回它的账户 ID+邮箱+密钥 (名字随意)。</div>
   </div>
 </div>
 
@@ -2058,7 +2054,7 @@ async function openAccMgr(){
     b.innerHTML=(d.accounts||[]).map(function(a){
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
         '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
-        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'" title="'+(a.builtin?'从面板隐藏默认账号, 之后可重新添加恢复':'删除该账号')+'">删除</button>'+
+        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'" title="'+(a.builtin?'删除后请用下方表单以自定义名字重新添加':'删除该账号')+'">删除</button>'+
         '</div>';
     }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
