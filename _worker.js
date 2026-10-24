@@ -491,6 +491,7 @@ async function getMeta(env) {
   meta.paused = (saved && saved.paused) || null;
   meta.accounts = Array.isArray(saved && saved.accounts) ? saved.accounts : [];
   meta.curAcc = str(saved && saved.curAcc);
+  meta.hideBuiltin = !!(saved && saved.hideBuiltin);
   for (const raw of (saved && saved.chats) || []) {
     const name = str(raw);
     const resolved = isChatId(name) ? "" : str((await storeGet(env, await chatKey(env, name)) || ""));
@@ -509,6 +510,7 @@ async function saveMeta(env, meta) {
     paused: meta.paused || null,
     accounts: meta.accounts || [],
     curAcc: meta.curAcc || "",
+    hideBuiltin: !!meta.hideBuiltin, // 默认账号是否被"删除"(隐藏)
   });
 }
 
@@ -518,8 +520,11 @@ async function saveMeta(env, meta) {
 // 提醒 (alerts/watch/隧道状态) 按账号隔离: 键里带账号 ID, 互不串扰。
 function accountList(meta, env) {
   const list = [];
-  if ((env.CF_API_TOKEN || (env.EMAIL && env.API_KEY)) && env.CF_ACCOUNT_ID)
-    list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true, authType: env.EMAIL && env.API_KEY ? "key" : "token" });
+  // 默认账号 (环境变量) 可通过面板"删除"隐藏 (meta.hideBuiltin), 只用面板添加的账号
+  if (!meta || !meta.hideBuiltin) {
+    if ((env.CF_API_TOKEN || (env.EMAIL && env.API_KEY)) && env.CF_ACCOUNT_ID)
+      list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true, authType: env.EMAIL && env.API_KEY ? "key" : "token" });
+  }
   for (const a of (meta && meta.accounts) || [])
     if (a && str(a.acc)) {
       if (str(a.key)) list.push({ name: str(a.name) || str(a.acc), email: str(a.email), key: str(a.key), acc: str(a.acc), authType: "key" });
@@ -698,15 +703,22 @@ async function handleApi(request, env, path) {
   if (sUser === false) return json({ error: "请先登录" }, 401);
 
   // 修改密码: 输入旧密码 + 新密码 (至少 6 位); 密码哈希存 KV/D1 用户表
+  // 兼容: 更新前的老会话没有用户名 (sUser 为空) → 若用户表恰好只有一个用户, 视为该用户
   if (path === "/api/passwd") {
     requireKv(env);
-    if (!sUser) return json({ error: "当前会话为环境变量密码登录, 请先绑定 D1/KV 后用账号登录" }, 400);
+    let uname = sUser;
+    if (!uname) {
+      const users0 = (await storeGet(env, USERS_KEY)) || {};
+      const all0 = Object.keys(users0);
+      if (all0.length === 1) uname = all0[0];
+      else return json({ error: "当前会话不包含账号信息, 请退出后重新登录再修改密码" }, 400);
+    }
     const users = (await storeGet(env, USERS_KEY)) || {};
-    if (!users[sUser]) return json({ error: "当前账号不在用户列表" }, 400);
+    if (!users[uname]) return json({ error: "当前账号不在用户列表" }, 400);
     if (String(d.newpass || "").length < 6) return json({ error: "新密码至少 6 位" }, 400);
-    if (!sameSecret(await passHash(env, sUser, str(d.oldpass)), users[sUser]))
+    if (!sameSecret(await passHash(env, uname, str(d.oldpass)), users[uname]))
       return json({ error: "旧密码错误" }, 401);
-    users[sUser] = await passHash(env, sUser, str(d.newpass));
+    users[uname] = await passHash(env, uname, str(d.newpass));
     await storePut(env, USERS_KEY, users);
     return json({ ok: true });
   }
@@ -875,6 +887,12 @@ async function handleApi(request, env, path) {
       } catch (e) {
         return json({ error: "账号验证失败: " + (e && e.message) }, 400);
       }
+      if (accId === env.CF_ACCOUNT_ID && meta.hideBuiltin) {
+        // 添加的环境变量账号曾被"删除"(隐藏) → 恢复显示即可
+        meta.hideBuiltin = false;
+        await saveMeta(env, meta);
+        return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
+      }
       meta.accounts.push(Object.assign({ name, acc: accId }, auth));
       await saveMeta(env, meta);
       return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
@@ -883,7 +901,14 @@ async function handleApi(request, env, path) {
       requireKv(env);
       const accId = str(d.acc);
       const builtin = accountList(meta, env).find((a) => a.acc === accId && a.builtin);
-      if (builtin) return json({ error: "环境变量配置的默认账号不能删除" }, 400);
+      if (builtin) {
+        // 默认账号来自环境变量, 无法真正移除 → 面板里隐藏, 只用添加的账号;
+        // 之后在"添加账号"里填同一个账户 ID 即可恢复显示
+        meta.hideBuiltin = true;
+        if (meta.curAcc === accId) meta.curAcc = "";
+        await saveMeta(env, meta);
+        return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
+      }
       meta.accounts = meta.accounts.filter((a) => str(a.acc) !== accId);
       if (meta.curAcc === accId) meta.curAcc = "";
       await saveMeta(env, meta);
@@ -1845,23 +1870,12 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <div style="flex:1;min-width:0"><label>账号名称 <span class="amhint">(邮箱/中英文/数字)</span></label><input id="am_name" placeholder="例如 admin@x.com / 主账号" autocomplete="off"></div>
       <div style="flex:1.2;min-width:0"><label>账户 ID (32 位)</label><input id="am_acc" placeholder="Cloudflare 账户 ID" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
     </div>
-    <label>认证方式</label>
-    <select id="am_mode">
-      <option value="key">邮箱 + Global API Key (推荐, 全权限)</option>
-      <option value="token">API Token (范围更小, 需 Tunnel+DNS 权限)</option>
-    </select>
-    <div id="am_key_wrap">
-      <label>该账户的登录邮箱</label>
-      <input id="am_email" placeholder="例如 you@x.com" autocapitalize="off" autocomplete="off" spellcheck="false">
-      <label>该账户的 Global API Key</label>
-      <input id="am_key" placeholder="My Profile → API Keys → Global API Key, 粘贴后点添加" autocapitalize="off" autocomplete="off" spellcheck="false">
-    </div>
-    <div id="am_token_wrap" style="display:none">
-      <label>该账户的 API Token (权限同环境变量要求)</label>
-      <input id="am_token" placeholder="粘贴后点添加, 会先验证再保存" autocapitalize="off" autocomplete="off" spellcheck="false">
-    </div>
+    <label>该账户的登录邮箱</label>
+    <input id="am_email" placeholder="例如 you@x.com" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <label>该账户的 Global API Key (全权限)</label>
+    <input id="am_key" placeholder="My Profile → API Keys → Global API Key, 粘贴后点添加" autocapitalize="off" autocomplete="off" spellcheck="false">
     <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
-    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥/Token 只存 D1/KV, 不会下发到页面。环境变量配置的"默认账号"不可删除。切换账号后隧道列表/提醒规则/域名随账号切换。</div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥只存 KV, 不会下发到页面。默认账号(环境变量)现在也可删除, 只用这里添加的账号; 想恢复就在此填回同一个账户 ID。</div>
   </div>
 </div>
 
@@ -2043,38 +2057,28 @@ async function openAccMgr(){
     var d=await api('/api/acc',{action:'list'});
     b.innerHTML=(d.accounts||[]).map(function(a){
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
+        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'" title="'+(a.builtin?'从面板隐藏默认账号, 之后可重新添加恢复':'删除该账号')+'">删除</button>'+
         '</div>';
-    }).join('')||'<div class="empty">暂无添加的账号</div>';
+    }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
-$('am_mode').onchange=function(){
-  var key=$('am_mode').value==='key';
-  $('am_key_wrap').style.display=key?'':'none';
-  $('am_token_wrap').style.display=key?'none':'';
-};
 $('am_add').onclick=async function(){
   var b=this,name=$('am_name').value.trim(),acc=$('am_acc').value.trim();
-  var keyMode=$('am_mode').value==='key';
-  var email=$('am_email').value.trim(),key=$('am_key').value.trim(),token=$('am_token').value.trim();
+  var email=$('am_email').value.trim(),key=$('am_key').value.trim();
   if(!name||!acc){toast('请填写名称和账户 ID','err');return}
-  if(keyMode&&(!email||!key)){toast('请填写该账户的登录邮箱和 Global API Key','err');return}
-  if(!keyMode&&!token){toast('请填写 API Token','err');return}
+  if(!email||!key){toast('请填写该账户的登录邮箱和 Global API Key','err');return}
   b.disabled=true;b.innerHTML='<span class="spin"></span> 验证中';
   try{
-    var payload={action:'add',name:name,acc:acc};
-    if(keyMode){payload.mode='key';payload.email=email;payload.key=key}
-    else payload.token=token;
-    var d=await api('/api/acc',payload);
-    $('am_name').value='';$('am_acc').value='';$('am_email').value='';$('am_key').value='';$('am_token').value='';
+    var d=await api('/api/acc',{action:'add',name:name,acc:acc,mode:'key',email:email,key:key});
+    $('am_name').value='';$('am_acc').value='';$('am_email').value='';$('am_key').value='';
     toast('账号已添加: '+name);
     var items=d.accounts||[];accNames={};
     $('am_body').innerHTML=items.map(function(a){
       accNames[a.acc]=a.name;
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
+        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>'+
         '</div>';
     }).join('');
     renderAccSel({accounts:items,cur:curAcc});
@@ -2091,11 +2095,11 @@ document.addEventListener('click',async function(e){
     $('am_body').innerHTML=items.map(function(a){
       accNames[a.acc]=a.name;
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
-        (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
+        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>'+
         '</div>';
-    }).join('')||'<div class="empty">暂无添加的账号</div>';
-    // 删除的是当前账号 (或其已不存在) → 自动切回默认账号 (env 账号), 重新加载列表/域名/提醒
+    }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
+    // 删除的是当前账号 (或其已不存在) → 自动切到剩余账号里的第一个, 重新加载列表/域名/提醒
     if(curAcc===t.dataset.amdel||!items.some(function(a){return a.acc===curAcc})){
       var fallback=items.find(function(a){return a.builtin})||items[0];
       if(fallback){
