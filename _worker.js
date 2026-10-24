@@ -304,19 +304,23 @@ async function hmac(env, text) {
   return b64u(s);
 }
 
-async function makeSession(env) {
-  const raw = b64u(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + SESSION_TTL }));
+async function makeSession(env, user) {
+  const raw = b64u(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + SESSION_TTL, u: str(user).slice(0, 64) }));
   return raw + "." + (await hmac(env, "sid:" + raw));
 }
 
+// 校验成功返回用户名 (空串=无用户名的旧式会话/环境变量回退), 失败返回 false
 async function checkSession(env, value) {
   const i = String(value || "").indexOf(".");
   if (i < 0) return false;
   const raw = value.slice(0, i);
   const sig = value.slice(i + 1);
   let exp = 0;
+  let user = "";
   try {
-    exp = Number(JSON.parse(unb64u(raw)).exp) || 0;
+    const p = JSON.parse(unb64u(raw));
+    exp = Number(p.exp) || 0;
+    user = str(p.u).slice(0, 64);
   } catch (e) {
     return false;
   }
@@ -324,7 +328,7 @@ async function checkSession(env, value) {
   const want = await hmac(env, "sid:" + raw);
   let diff = want.length ^ sig.length;
   for (let k = 0; k < sig.length; k++) diff |= (sig.charCodeAt(k) || 0) ^ (want.charCodeAt(k) || 0);
-  return diff === 0;
+  return diff === 0 ? user : false;
 }
 
 function cookieValue(request, name) {
@@ -418,6 +422,15 @@ async function botSelfErr(env, token, id) {
 const chatKey = async (env, name) => "chat:" + (await hmac(env, "chat:" + name)).slice(0, 20);
 
 const META_KEY = "meta:settings";
+
+// ---- 面板用户账号 ----
+// 首次使用自动创建默认账号 ys670053358 / 123456 (存储于 KV/D1, 密码只存哈希);
+// 登录后可在面板右上角 🔒 输入旧密码+新密码修改。未绑定存储时回退为环境变量 PASSWORD 单密码。
+const USERS_KEY = "panel:users";
+const DEFAULT_PANEL_USER = "ys670053358";
+const DEFAULT_PANEL_PASS = "123456";
+const passHash = (env, name, pass) => hmac(env, "pwd:" + str(name) + ":" + str(pass));
+const getUsers = async (env) => (store(env) ? ((await storeGet(env, USERS_KEY)) || {}) : null);
 
 // ---- 存储抽象层: D1 优先, 未绑定 D1 时回退 KV ----
 // 两种后端同一个键值语义: get(key)->json|null, put(key,json), del(key)
@@ -643,12 +656,36 @@ async function handleApi(request, env, path) {
 
   // 登录 / 退出 (不需要已登录)
   if (path === "/api/login") {
-    if (!sameSecret(str(d.password), String(env.PASSWORD))) {
-      await new Promise((r) => setTimeout(r, 500)); // 放慢暴力尝试
-      return json({ error: "密码错误" }, 401);
+    const pass = str(d.password);
+    let user = "";
+    if (store(env)) {
+      // 用户账号体系 (存 KV/D1): 表 { 用户名: HMAC 密码哈希 }
+      const users = (await storeGet(env, USERS_KEY)) || {};
+      if (!Object.keys(users).length) {
+        // 首次使用: 自动创建默认账号 ys670053358 / 123456 (请登录后立即修改密码)
+        const name0 = DEFAULT_PANEL_USER;
+        users[name0] = await passHash(env, name0, DEFAULT_PANEL_PASS);
+        await storePut(env, USERS_KEY, users);
+      }
+      const name = str(d.user) || "";
+      const all = Object.keys(users);
+      if ((name && users[name]) || (!name && all.length === 1)) {
+        const u = name || all[0];
+        if (sameSecret(await passHash(env, u, pass), users[u] || "")) user = u;
+      }
+      if (!user) {
+        await new Promise((r) => setTimeout(r, 500)); // 放慢暴力尝试
+        return json({ error: "账号或密码错误" }, 401);
+      }
+    } else {
+      // 未绑定存储: 回退到环境变量 PASSWORD (旧式单密码)
+      if (!sameSecret(pass, String(env.PASSWORD))) {
+        await new Promise((r) => setTimeout(r, 500));
+        return json({ error: "密码错误" }, 401);
+      }
     }
     return new Response(JSON.stringify({ ok: true }), {
-      headers: { "Content-Type": "application/json", "Set-Cookie": setCookie(await makeSession(env), SESSION_TTL) },
+      headers: { "Content-Type": "application/json", "Set-Cookie": setCookie(await makeSession(env, user), SESSION_TTL) },
     });
   }
   if (path === "/api/logout")
@@ -656,8 +693,23 @@ async function handleApi(request, env, path) {
       headers: { "Content-Type": "application/json", "Set-Cookie": setCookie("", 0) },
     });
 
-  // 以下接口都需要登录
-  if (!(await checkSession(env, cookieValue(request, COOKIE)))) return json({ error: "请先登录" }, 401);
+  // 以下接口都需要登录 (sessUser 为空串表示环境变量密码的旧式会话)
+  const sUser = await checkSession(env, cookieValue(request, COOKIE));
+  if (sUser === false) return json({ error: "请先登录" }, 401);
+
+  // 修改密码: 输入旧密码 + 新密码 (至少 6 位); 密码哈希存 KV/D1 用户表
+  if (path === "/api/passwd") {
+    requireKv(env);
+    if (!sUser) return json({ error: "当前会话为环境变量密码登录, 请先绑定 D1/KV 后用账号登录" }, 400);
+    const users = (await storeGet(env, USERS_KEY)) || {};
+    if (!users[sUser]) return json({ error: "当前账号不在用户列表" }, 400);
+    if (String(d.newpass || "").length < 6) return json({ error: "新密码至少 6 位" }, 400);
+    if (!sameSecret(await passHash(env, sUser, str(d.oldpass)), users[sUser]))
+      return json({ error: "旧密码错误" }, 401);
+    users[sUser] = await passHash(env, sUser, str(d.newpass));
+    await storePut(env, USERS_KEY, users);
+    return json({ ok: true });
+  }
 
   if (path === "/api/tg") {
     const meta = await getMeta(env);
@@ -1087,7 +1139,7 @@ async function handleApi(request, env, path) {
   }
 
   if (path === "/api/init")
-    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "" });
+    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "", me: sUser });
 
   if (path === "/api/create") {
     const name = str(d.name), service = str(d.service);
@@ -1315,11 +1367,11 @@ export default {
     if (request.method !== "GET" && request.method !== "HEAD")
       return new Response("Method Not Allowed", { status: 405 });
 
-    const loggedIn = await checkSession(env, cookieValue(request, COOKIE));
+    const loggedIn = await checkSession(env, cookieValue(request, COOKIE)); // 返回用户名或 false
     const pwa = pwaResponse(path);
     if (pwa) return pwa;
 
-    if (!loggedIn) return htmlRes(LOGIN_HTML);
+    if (loggedIn === false) return htmlRes(LOGIN_HTML);
     if (path === "/" || path === "/index.html") return htmlRes(HTML);
     return new Response("Not Found", { status: 404 });
   },
@@ -1381,22 +1433,26 @@ button.oks{opacity:1;background:linear-gradient(135deg,#17a35f,#2ecc7d);box-shad
     <h1>Cloudflare 隧道管理面板</h1>
     <p class="sub">Tunnel 管理与 Telegram 上下线提醒</p>
     <div class="field">
+      <span class="li">👤</span>
+      <input id="usr" name="username" placeholder="账号 (默认: ys670053358)" autocomplete="username" inputmode="email">
+    </div>
+    <div class="field">
       <span class="li">🔒</span>
-      <input id="pw" type="password" name="password" placeholder="请输入访问密码" autocomplete="current-password" autofocus>
+      <input id="pw" type="password" name="password" placeholder="请输入密码" autocomplete="current-password">
     </div>
     <button id="go" type="submit">登 录</button>
     <div class="err" id="err"></div>
-    <div class="foot"><a href="https://github.com/eooce/cloudflare-tunnel-panel" target="_blank" rel="noopener noreferrer">${CF_LOGO} Cloudflare Tunnel Panel</a></div>
+    <div class="foot"><a href="https://github.com/XIEBROxzz/Cloudflare-Tunnel-Panel" target="_blank" rel="noopener noreferrer">${CF_LOGO} Cloudflare Tunnel Panel</a></div>
   </form>
 </div>
 <script>
-var f=document.getElementById('f'),pw=document.getElementById('pw'),go=document.getElementById('go'),err=document.getElementById('err');
+var f=document.getElementById('f'),usr=document.getElementById('usr'),pw=document.getElementById('pw'),go=document.getElementById('go'),err=document.getElementById('err');
 f.addEventListener('submit',async function(e){
   e.preventDefault();
   if(!pw.value){err.textContent='⚠ 请输入密码';pw.focus();return}
   go.disabled=true;go.textContent='登录中...';err.textContent='';
   try{
-    var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw.value})});
+    var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:usr.value.trim(),password:pw.value})});
     var d=await r.json().catch(function(){return {}});
     if(!r.ok)throw new Error(d.error||'登录失败');
     go.textContent='✓ 登录成功';go.classList.add('oks');
@@ -1622,6 +1678,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       </div>
           <button class="btn sm" id="assets_mgr" title="资产管理">📂</button>
       <button class="btn sm" id="acc_mgr" title="管理账号"><svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 16 16" style="font-size:15px;vertical-align:-2px"><path d="M0 0h16v16H0z" fill="none"/><path fill="#d86d16" d="M6 5a2 2 0 1 1 4 0a2 2 0 0 1-4 0m-.5 3h5A1.5 1.5 0 0 1 12 9.5c0 1.116-.459 2.01-1.212 2.615C10.047 12.71 9.053 13 8 13s-2.047-.29-2.788-.885C4.46 11.51 4 10.616 4 9.5A1.5 1.5 0 0 1 5.5 8M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0M1 8a7 7 0 1 1 14 0A7 7 0 0 1 1 8"/></svg></button>
+      <button class="btn sm" id="pwd_btn" title="修改登录密码">🔒</button>
       <button class="btn sm" id="refresh">刷新</button>
       <button class="btn sm" id="theme" title="切换白天/黑夜主题">🌙</button>
     </div>
@@ -1636,6 +1693,10 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         <div class="card">
           <h3><span>隧道状态</span><span class="pill" id="alert_state">-</span></h3>
           <div id="dash"><div class="empty">加载中...</div></div>
+        </div>
+        <div class="card">
+          <h3><span>🌐 账号域名</span><span class="pill" id="dz_n">-</span></h3>
+          <div id="dz_list"><div class="empty">加载中...</div></div>
         </div>
       </section>
 
@@ -1722,6 +1783,18 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
   <input id="svc" placeholder="http://localhost:8001" autocapitalize="off" autocomplete="off">
   <div class="preview" id="pv"></div>
   <div class="btns"><button class="btn gray" id="m_cancel">取消</button><button class="btn" id="go">创建隧道</button></div>
+</div>
+
+<div class="modal" id="mPwd">
+  <h3><span>修改登录密码</span><button class="x" id="p_x">✕</button></h3>
+  <div class="hint" id="p_card" style="margin-bottom:4px"></div>
+  <label>旧密码</label>
+  <input id="p_old" type="password" autocapitalize="off" autocomplete="current-password">
+  <label>新密码 (至少 6 位)</label>
+  <input id="p_new" type="password" autocapitalize="off" autocomplete="new-password">
+  <label>确认新密码</label>
+  <input id="p_new2" type="password" autocapitalize="off" autocomplete="new-password">
+  <div class="btns"><button class="btn gray" id="p_cancel">取消</button><button class="btn" id="p_save">保存新密码</button></div>
 </div>
 
 <div class="modal" id="mToken">
@@ -2148,6 +2221,7 @@ async function loadList(){
     allTunnels=d.tunnels||[];allAlertOn=d.alertOn||{};
     upTs={};(d.tunnels||[]).forEach(function(t){if(t.since)upTs[t.id]=t.since});
     setSum(d);renderDash(d);renderList();
+    loadDashZones(); // 仪表盘域名卡片随账号刷新 (不阻塞主列表)
   }catch(e){$('sum').innerHTML='';l.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 async function loadMeta(){
@@ -2209,6 +2283,7 @@ $('sub').addEventListener('input',function(){var v=$('sub').value;subDirty=v!=='
 async function initZones(){
   try{
     var d=await api('/api/init');
+    if(d.me!==undefined)curPanelUser=d.me||'';
     $('zone').innerHTML=d.zones.length?d.zones.map(function(z){return '<option value="'+esc(z.id)+'">.'+esc(z.name)+'</option>'}).join(''):'<option value="">无可用域名</option>';
     if(d.service)$('svc').value=d.service;
     preview();
@@ -2252,6 +2327,47 @@ async function loadAssets(){
       el.onclick=function(){closeModal();showDomainsPage(el.dataset.azone,el.dataset.aname,'')};
     });
   }catch(e){$('a_body').innerHTML='<div class="empty">加载失败</div>';fail(e)}
+}
+
+// ---- 修改登录密码 (面板用户 ys670053358 等) ----
+var curPanelUser='';
+async function pwdOpen(){
+  $('p_old').value='';$('p_new').value='';$('p_new2').value='';
+  $('p_card').textContent=curPanelUser?('当前账号: '+curPanelUser):'';
+  openModal('mPwd');
+  setTimeout(function(){$('p_old').focus()},50);
+}
+$('pwd_btn').onclick=pwdOpen;
+$('p_x').onclick=closeModal;$('p_cancel').onclick=closeModal;
+$('p_save').onclick=async function(){
+  var b=this,oldv=$('p_old').value,newv=$('p_new').value,n2=$('p_new2').value;
+  if(!oldv||!newv){toast('请填写旧密码和新密码','err');return}
+  if(newv.length<6){toast('新密码至少 6 位','err');return}
+  if(newv!==n2){toast('两次输入的新密码不一致','err');return}
+  b.disabled=true;b.innerHTML='<span class="spin"></span> 保存中';
+  try{
+    await api('/api/passwd',{oldpass:oldv,newpass:newv});
+    toast('密码已修改, 下次登录用新密码');
+    closeModal();
+  }catch(e){fail(e)}
+  b.disabled=false;b.innerHTML='保存新密码';
+};
+
+// ---- 仪表盘: 账号域名卡片 (随账号切换刷新) ----
+async function loadDashZones(){
+  var b=$('dz_list');
+  try{
+    var d=await api('/api/assets');
+    $('dz_n').textContent=d.zones.length?('共 '+d.zones.length+' 个'):'0 个';
+    b.innerHTML=d.zones.length?d.zones.map(function(z){
+      return '<div class="acc-item" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
+        '<div style="display:flex;align-items:center;gap:8px"><strong style="font-size:13.5px">🌐 '+esc(z.name)+'</strong>'+
+        '<span style="margin-left:auto" class="btn sm">管理 →</span></div></div>';
+    }).join(''):'<div class="empty">当前账号下没有可用域名</div>';
+    b.querySelectorAll('[data-dzid]').forEach(function(el){
+      el.onclick=function(){showDomainsPage(el.dataset.dzid,el.dataset.dzname,'')};
+    });
+  }catch(e){b.innerHTML='<div class="empty">加载失败</div>';$('dz_n').textContent=''}
 }
 
 // 页面版域名管理: 域名 → 子域名 → 详情 (DNS 增删改 / Origin 规则 / 证书 / 关联隧道)
