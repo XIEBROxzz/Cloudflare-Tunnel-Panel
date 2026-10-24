@@ -73,10 +73,14 @@ function zhError(errors) {
 }
 
 async function cf(env, path, method = "GET", body) {
-  // 认证优先级: 1) 当前所选账号的专属 Token (env.cfToken) → 2) EMAIL + API_KEY → 3) 环境变量 Token
+  // 认证优先级: 1) 账号专属 Token (cfToken) → 2) 账号专属邮箱+Key (cfEmail/cfKey) →
+  //            3) 环境变量 EMAIL + API_KEY → 4) 环境变量 API Token
   const headers = { "Content-Type": "application/json" };
   if (env.cfToken) {
     headers["Authorization"] = "Bearer " + env.cfToken;
+  } else if (env.cfEmail && env.cfKey) {
+    headers["X-Auth-Email"] = env.cfEmail;
+    headers["X-Auth-Key"] = env.cfKey;
   } else if (env.EMAIL && env.API_KEY) {
     headers["X-Auth-Email"] = env.EMAIL;
     headers["X-Auth-Key"] = env.API_KEY;
@@ -502,9 +506,12 @@ async function saveMeta(env, meta) {
 function accountList(meta, env) {
   const list = [];
   if ((env.CF_API_TOKEN || (env.EMAIL && env.API_KEY)) && env.CF_ACCOUNT_ID)
-    list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true });
+    list.push({ name: "默认账号", token: "", acc: env.CF_ACCOUNT_ID, builtin: true, authType: env.EMAIL && env.API_KEY ? "key" : "token" });
   for (const a of (meta && meta.accounts) || [])
-    if (a && str(a.acc)) list.push({ name: str(a.name) || str(a.acc), token: str(a.token), acc: str(a.acc) });
+    if (a && str(a.acc)) {
+      if (str(a.key)) list.push({ name: str(a.name) || str(a.acc), email: str(a.email), key: str(a.key), acc: str(a.acc), authType: "key" });
+      else list.push({ name: str(a.name) || str(a.acc), token: str(a.token), acc: str(a.acc), authType: "token" });
+    }
   return list;
 }
 function pickAccount(meta, env, sel) {
@@ -754,7 +761,15 @@ async function handleApi(request, env, path) {
   const meta0 = store(env) ? await getMeta(env) : { accounts: [] };
   const actx = pickAccount(meta0, env, env.cfAcc);
   if (!actx) return json({ error: "未配置任何 Cloudflare 账号 (环境变量或面板多账号管理)" }, 500);
-  env.cfToken = actx.token || env.CF_API_TOKEN; // 该账号专属 API Token (默认账号用 EMAIL + API_KEY 或 env)
+  // 账号专属认证: Token 账号用 Bearer; Global Key 账号用邮箱+密钥 (cf() 里按 cfEmail/cfKey 走 X-Auth 头)
+  if (actx.key) {
+    env.cfToken = "";
+    env.cfEmail = str(actx.email) || env.EMAIL;
+    env.cfKey = actx.key;
+  } else {
+    env.cfEmail = ""; env.cfKey = "";
+    env.cfToken = actx.token || env.CF_API_TOKEN; // 该账号专属 API Token (默认账号用 EMAIL + API_KEY 或 env)
+  }
   env.cfAcc = actx.acc;
 
   const acc = env.cfAcc;
@@ -774,7 +789,7 @@ async function handleApi(request, env, path) {
     const action = str(d.action);
     if (action === "list") {
       return json({
-        accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })),
+        accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })),
         cur: acc,
         persistent: !!store(env),
       });
@@ -782,26 +797,35 @@ async function handleApi(request, env, path) {
     if (action === "add") {
       requireKv(env);
       const name = str(d.name).trim().slice(0, 64);
-      const token = str(d.token);
       const accId = str(d.acc);
       // 名称规则: 1-64 字符, 允许中文/英文字母/数字/空格/@._-+ 等; 至少含一个文字(字母/汉字/数字),
       // 不能全是标点符号 (防止只填 "..." 或 "---" 这种无法辨认的名字)
       if (!name || !/[\p{L}\p{N}]/u.test(name))
         return json({ error: "账号名称不能为空, 且需至少包含一个文字或数字 (不能全是标点符号)" }, 400);
-      if (!/^[0-9a-f]{32}$/i.test(accId) || !token)
-        return json({ error: "请填写 32 位账户 ID 和该账户的 API Token" }, 400);
+      if (!/^[0-9a-f]{32}$/i.test(accId)) return json({ error: "请填写 32 位账户 ID" }, 400);
+      // 两种认证方式: (1) API Token  (2) 邮箱 + Global API Key
+      const auth = {};
+      if (str(d.key)) {
+        const email = str(d.email).trim();
+        if (!email) return json({ error: "Global API Key 方式需要同时填写该账户的登录邮箱" }, 400);
+        auth.email = email;
+        auth.key = str(d.key);
+      } else if (str(d.token)) {
+        auth.token = str(d.token);
+      } else return json({ error: "请提供 API Token, 或在该账号管理里选择“邮箱 + Global API Key”方式" }, 400);
       if (accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "该账户 ID 已存在" }, 400);
-      // 先验证: 直接用该 Token 请求此账户的隧道列表 (面板核心操作), 通得过才保存。
+      // 先验证: 用该账号自己的凭据请求此账户的隧道列表 (面板核心操作), 通得过才保存。
       // 注意: /accounts/{id} (账户详情) 需要 "Account Settings Read" 这类账户级权限,
       // 面板权限集里没有, 用它验证会误报权限不足; 隧道列表才是真实需要的能力。
       try {
-        await cf({ cfToken: token, CF_API_TOKEN: token }, `/accounts/${accId}/cfd_tunnel?per_page=1`);
+        const probe = auth.key ? { cfEmail: auth.email, cfKey: auth.key, cfToken: "" } : { cfToken: auth.token, CF_API_TOKEN: auth.token };
+        await cf(probe, `/accounts/${accId}/cfd_tunnel?per_page=1`);
       } catch (e) {
         return json({ error: "账号验证失败: " + (e && e.message) }, 400);
       }
-      meta.accounts.push({ name, token, acc: accId });
+      meta.accounts.push(Object.assign({ name, acc: accId }, auth));
       await saveMeta(env, meta);
-      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
+      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
     }
     if (action === "del") {
       requireKv(env);
@@ -811,7 +835,7 @@ async function handleApi(request, env, path) {
       meta.accounts = meta.accounts.filter((a) => str(a.acc) !== accId);
       if (meta.curAcc === accId) meta.curAcc = "";
       await saveMeta(env, meta);
-      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin })) });
+      return json({ ok: true, accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })) });
     }
     if (action === "switch") {
       const accId = str(d.acc);
@@ -1748,10 +1772,23 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <div style="flex:1;min-width:0"><label>账号名称 <span class="amhint">(邮箱/中英文/数字)</span></label><input id="am_name" placeholder="例如 admin@x.com / 主账号" autocomplete="off"></div>
       <div style="flex:1.2;min-width:0"><label>账户 ID (32 位)</label><input id="am_acc" placeholder="Cloudflare 账户 ID" autocapitalize="off" autocomplete="off" spellcheck="false"></div>
     </div>
-    <label>该账户的 API Token (权限同环境变量要求)</label>
-    <input id="am_token" placeholder="粘贴后点添加, 会先验证再保存" autocapitalize="off" autocomplete="off" spellcheck="false">
+    <label>认证方式</label>
+    <select id="am_mode">
+      <option value="key">邮箱 + Global API Key (推荐, 全权限)</option>
+      <option value="token">API Token (范围更小, 需 Tunnel+DNS 权限)</option>
+    </select>
+    <div id="am_key_wrap">
+      <label>该账户的登录邮箱</label>
+      <input id="am_email" placeholder="例如 you@x.com" autocapitalize="off" autocomplete="off" spellcheck="false">
+      <label>该账户的 Global API Key</label>
+      <input id="am_key" placeholder="My Profile → API Keys → Global API Key, 粘贴后点添加" autocapitalize="off" autocomplete="off" spellcheck="false">
+    </div>
+    <div id="am_token_wrap" style="display:none">
+      <label>该账户的 API Token (权限同环境变量要求)</label>
+      <input id="am_token" placeholder="粘贴后点添加, 会先验证再保存" autocapitalize="off" autocomplete="off" spellcheck="false">
+    </div>
     <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
-    <div class="hint" style="margin-top:8px">验证通过才保存; Token 只存在D1, 不会下发到页面。环境变量配置的"默认账号"不可删除。切换账号后隧道列表/提醒规则/域名随账号切换。</div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥/Token 只存 D1/KV, 不会下发到页面。环境变量配置的"默认账号"不可删除。切换账号后隧道列表/提醒规则/域名随账号切换。</div>
   </div>
 </div>
 
@@ -1933,25 +1970,37 @@ async function openAccMgr(){
     var d=await api('/api/acc',{action:'list'});
     b.innerHTML=(d.accounts||[]).map(function(a){
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
         (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
         '</div>';
     }).join('')||'<div class="empty">暂无添加的账号</div>';
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
+$('am_mode').onchange=function(){
+  var key=$('am_mode').value==='key';
+  $('am_key_wrap').style.display=key?'':'none';
+  $('am_token_wrap').style.display=key?'none':'';
+};
 $('am_add').onclick=async function(){
-  var b=this,name=$('am_name').value.trim(),acc=$('am_acc').value.trim(),token=$('am_token').value.trim();
-  if(!name||!acc||!token){toast('请填写名称、账户 ID 和 API Token','err');return}
+  var b=this,name=$('am_name').value.trim(),acc=$('am_acc').value.trim();
+  var keyMode=$('am_mode').value==='key';
+  var email=$('am_email').value.trim(),key=$('am_key').value.trim(),token=$('am_token').value.trim();
+  if(!name||!acc){toast('请填写名称和账户 ID','err');return}
+  if(keyMode&&(!email||!key)){toast('请填写该账户的登录邮箱和 Global API Key','err');return}
+  if(!keyMode&&!token){toast('请填写 API Token','err');return}
   b.disabled=true;b.innerHTML='<span class="spin"></span> 验证中';
   try{
-    var d=await api('/api/acc',{action:'add',name:name,acc:acc,token:token});
-    $('am_name').value='';$('am_acc').value='';$('am_token').value='';
+    var payload={action:'add',name:name,acc:acc};
+    if(keyMode){payload.mode='key';payload.email=email;payload.key=key}
+    else payload.token=token;
+    var d=await api('/api/acc',payload);
+    $('am_name').value='';$('am_acc').value='';$('am_email').value='';$('am_key').value='';$('am_token').value='';
     toast('账号已添加: '+name);
     var items=d.accounts||[];accNames={};
     $('am_body').innerHTML=items.map(function(a){
       accNames[a.acc]=a.name;
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
         (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
         '</div>';
     }).join('');
@@ -1969,7 +2018,7 @@ document.addEventListener('click',async function(e){
     $('am_body').innerHTML=items.map(function(a){
       accNames[a.acc]=a.name;
       return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':'')+'</div></div>'+
+        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':(a.auth==='key'?' · 邮箱+Global Key':' · API Token'))+'</div></div>'+
         (a.builtin?'':'<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>')+
         '</div>';
     }).join('')||'<div class="empty">暂无添加的账号</div>';
@@ -2707,12 +2756,15 @@ export const scheduled = async (event, env, ctx) => {
   env = applyConfig(env); // 顶部"配置填写区"优先
   if (!store(env)) return;
   // Cron 检查遍历所有账号 (env 默认账号 + 面板添加的账号), 各自独立提醒
+  // Token 账号用 Bearer (cfToken); Global Key 账号用邮箱+密钥 (cfEmail/cfKey, cf() 自动走 X-Auth 头)
   const meta = await getMeta(env);
   for (const a of accountList(meta, env)) {
+    const sub = { ...env, cfAcc: a.acc };
+    if (a.key) { sub.cfEmail = a.email; sub.cfKey = a.key; sub.cfToken = ""; }
+    else { sub.cfEmail = ""; sub.cfKey = ""; sub.cfToken = a.token || env.CF_API_TOKEN; }
     try {
-      await runChecks({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
-        await listTunnels({ ...env, cfToken: a.token || env.CF_API_TOKEN, cfAcc: a.acc },
-          `/accounts/${a.acc}/cfd_tunnel`));
+      await runChecks(sub,
+        await listTunnels({ ...sub }, `/accounts/${a.acc}/cfd_tunnel`));
     } catch (e) {}
   }
 };
