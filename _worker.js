@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.2.3";
+const APP_VERSION = "2.2.4";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -2534,10 +2534,10 @@ async function loadDashZones(){
   var b=$('dz_list');
   try{
     var d=await api('/api/cdn');
-    var zs=d.zones||[];
-    var cdnN=zs.filter(function(z){return z.cdn}).length;
-    $('dz_n').textContent=zs.length?('CF CDN '+cdnN+'/'+zs.length+' 个域名'):'0 个';
-    $('dz_n').className='pill'+(cdnN?' cdn':'');
+    var all=d.zones||[];
+    var zs=all.filter(function(z){return z.cdn}); // 只显示命中 CF CDN 的域名
+    $('dz_n').textContent=zs.length?('CF CDN '+zs.length+' 个域名'):'0 个';
+    $('dz_n').className='pill'+(zs.length?' cdn':'');
     b.innerHTML=zs.length?zs.map(function(z){
       var hs=z.cdnHosts||[],cnt=z.cdnCount||0;
       var subs=hs.map(function(h){
@@ -2547,11 +2547,11 @@ async function loadDashZones(){
       return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
         '<div class="dz-main">'+
           '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
-          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'" title="代理 DNS（橙云）+ Origin 规则 + Origin 证书">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
           subs+
         '</div>'+
         '<span class="btn sm" style="flex:none">管理 →</span></div>';
-    }).join(''):'<div class="empty">当前账号下没有可用域名</div>';
+    }).join(''):'<div class="empty">暂无命中 CF CDN 的域名<br><span style="font-size:12px">需同时具备 代理 DNS + Origin 规则 + Origin 证书</span></div>';
     b.querySelectorAll('[data-dzhost]').forEach(function(el){
       el.onclick=function(ev){ev.stopPropagation();showDomainsPage(el.dataset.dzid,el.dataset.dzname,el.dataset.dzhost)};
     });
