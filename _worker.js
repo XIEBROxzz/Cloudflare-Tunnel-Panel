@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.2.1";
+const APP_VERSION = "2.2.2";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -1774,6 +1774,12 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .dz-meta .muted{opacity:.45}
 .dz-meta .pill{font-size:10.5px;padding:2px 7px}
 .dz-cdn{margin-top:5px;font-size:11.5px;color:#f6821f;word-break:break-all}
+.dz-sub{display:flex;align-items:center;gap:6px;margin-top:6px;font-size:12.5px;color:#f6821f;word-break:break-all;padding:6px 9px;border:1px dashed rgba(246,130,31,.4);border-radius:8px;background:rgba(246,130,31,.07);transition:background .15s}
+.dz-sub:hover{background:rgba(246,130,31,.15)}
+.dz-sub span{margin-left:auto;color:var(--sub);flex:none;font-size:11.5px}
+.dz-sub.muted{color:var(--sub);border-style:solid;border-color:var(--line);background:transparent;cursor:default}
+.dash-t:hover{background:var(--side2)}
+.dash-go{margin-left:auto;font-size:11.5px;color:var(--sub);flex:none}
 .empty{color:var(--sub);font-size:14px;text-align:center;padding:18px 0}
 .hint{font-size:13px;color:var(--sub);margin:2px 0 6px;line-height:1.65}
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:8}
@@ -1873,7 +1879,6 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         </div>
         <div class="card">
           <h3><span>🌐 账号域名</span><span class="pill" id="dz_n">-</span></h3>
-          <div class="hint" style="margin:0 0 8px;font-size:12px">橙色 CF CDN = 子域名同时具备 代理 DNS + Origin 规则 + Origin 证书</div>
           <div id="dz_list"><div class="empty">加载中...</div></div>
         </div>
       </section>
@@ -2303,11 +2308,16 @@ function renderDash(d){
   var box=$('dash');
   if(!d.tunnels||!d.tunnels.length){box.innerHTML='<div class="empty">暂无隧道</div>';return}
   box.innerHTML=d.tunnels.map(function(t){
-    return '<div class="item"><div class="top"><span class="dot '+esc(t.status)+'"></span>'+
+    return '<div class="item dash-t" style="cursor:pointer" data-tid="'+esc(t.id)+'" data-tname="'+esc(t.name)+'" title="打开隧道设置">'+
+      '<div class="top"><span class="dot '+esc(t.status)+'"></span>'+
       '<span class="nm">'+esc(t.name)+'</span>'+
-      '<span class="badge '+esc(t.status)+'">'+esc(stText[t.status]||t.status)+'</span></div>'+
+      '<span class="badge '+esc(t.status)+'">'+esc(stText[t.status]||t.status)+'</span>'+
+      '<span class="dash-go">设置 →</span></div>'+
       '<div class="id">'+esc(t.id)+'</div></div>';
   }).join('');
+  box.querySelectorAll('[data-tid]').forEach(function(el){
+    el.onclick=function(){openEdit(el.dataset.tid,el.dataset.tname)};
+  });
 }
 
 /* ---- 隧道列表 + 搜索 ---- */
@@ -2521,22 +2531,23 @@ async function loadDashZones(){
     $('dz_n').className='pill'+(cdnN?' cdn':'');
     b.innerHTML=zs.length?zs.map(function(z){
       var hs=z.cdnHosts||[],cnt=z.cdnCount||0;
-      var more=cnt>hs.length?' +'+(cnt-hs.length):'';
+      var subs=hs.map(function(h){
+        return '<div class="dz-sub" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'" data-dzhost="'+esc(h)+'">🔶 '+esc(h)+'<span>详情 →</span></div>';
+      }).join('');
+      if(cnt>hs.length)subs+='<div class="dz-sub muted">另有 '+(cnt-hs.length)+' 个 CDN 子域名</div>';
       return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
         '<div class="dz-main">'+
           '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
-          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?('CF CDN '+cnt+' 个子域名'):'无 CDN 子域名')+'</span></div>'+
-          '<div class="dz-meta">'+
-            '<span>DNS 代理 '+z.proxied+'/'+z.dns+'</span>'+
-            '<span'+(z.certs?'':' class="muted"')+'>Origin 证书 '+z.certs+'</span>'+
-            '<span'+(z.rules?'':' class="muted"')+'>Origin 规则 '+z.rules+'</span>'+
-            '<span'+(z.subdomains?'':' class="muted"')+'>子域名 '+(z.subdomains||0)+'</span>'+
-          '</div>'+
-          (hs.length?'<div class="dz-cdn">✅ '+hs.map(esc).join(' · ')+more+'</div>':'')+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
+          subs+
         '</div>'+
         '<span class="btn sm" style="flex:none">管理 →</span></div>';
     }).join(''):'<div class="empty">当前账号下没有可用域名</div>';
+    b.querySelectorAll('[data-dzhost]').forEach(function(el){
+      el.onclick=function(ev){ev.stopPropagation();showDomainsPage(el.dataset.dzid,el.dataset.dzname,el.dataset.dzhost)};
+    });
     b.querySelectorAll('[data-dzid]').forEach(function(el){
+      if(el.dataset.dzhost)return;
       el.onclick=function(){showDomainsPage(el.dataset.dzid,el.dataset.dzname,'')};
     });
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';$('dz_n').textContent='';$('dz_n').className='pill'}
