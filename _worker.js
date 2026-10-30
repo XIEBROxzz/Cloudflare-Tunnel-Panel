@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.2.2";
+const APP_VERSION = "2.2.3";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -1125,11 +1125,20 @@ async function handleApi(request, env, path) {
         if (inZone(n)) certHosts.push(n);
       }
       const flags = {};
+      // 子域名 → 隧道映射: 该域名出现在某条隧道的 ingress 路由里, 就认为由这条隧道提供服务
+      const tunnelByHost = new Map();
+      for (const t of ts) for (const r of t.ingress) {
+        const h = norm(r.hostname);
+        if (!inZone(h)) continue;
+        if (!tunnelByHost.has(h)) tunnelByHost.set(h, []);
+        tunnelByHost.get(h).push({ id: t.id, name: t.name, status: t.status });
+      }
       for (const h of hosts) {
         const proxied = proxiedByHost.get(h) === true;
         const rule = ruleCovers(h);
         const cert = certCovers(certHosts, h);
-        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied && rule && cert };
+        const tuns = tunnelByHost.get(h) || [];
+        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied && rule && cert, tunnels: tuns };
       }
 
       return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name, flags });
@@ -2569,7 +2578,7 @@ async function renderAssetsPage(){
           '<strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
           '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div>';
       }).join('')+'</div>';
-      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名同时具备 代理 DNS + Origin 规则 + Origin 证书。</div>';
+      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名同时具备 代理 DNS + Origin 规则 + Origin 证书; 🚇 标记表示该子域名出现在某条隧道的 ingress 路由中 (hostname 完全匹配), 点击可直接打开该隧道设置。</div>';
       box.innerHTML=h;
       $('p_r').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
       box.querySelectorAll('[data-azone]').forEach(function(el){
@@ -2587,7 +2596,14 @@ async function renderAssetsPage(){
       if(d.hosts.length){
         h+=d.hosts.map(function(x){
           var fl=(d.flags||{})[x]||{};
+          var tuns=fl.tunnels||[];
+          var tpill;
+          if(tuns.length){
+            var t0=tuns[0];
+            tpill='<span class="pill '+(t0.status==='healthy'?'on':'off')+'" data-topen="'+esc(t0.id)+'" data-tname="'+esc(t0.name)+'" title="点击打开隧道设置">🚇 '+esc(t0.name)+(tuns.length>1?' +'+(tuns.length-1):'')+'</span>';
+          }else tpill='<span class="pill" style="opacity:.55">无隧道</span>';
           var tags='<span class="pill '+(fl.dns?(fl.proxied?'on':'warn'):'off')+'">'+(fl.dns?(fl.proxied?'DNS 代理':'DNS 仅解析'):'无 DNS')+'</span>'+
+            tpill+
             '<span class="pill '+(fl.rule?'on':'')+'">规则 '+(fl.rule?'✓':'✗')+'</span>'+
             '<span class="pill '+(fl.cert?'on':'')+'">证书 '+(fl.cert?'✓':'✗')+'</span>'+
             (fl.cdn?'<span class="pill cdn">CF CDN</span>':'');
@@ -2602,6 +2618,9 @@ async function renderAssetsPage(){
       box.innerHTML=h;
       $('p_back').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
       $('p_r').onclick=function(){renderAssetsPage()};
+      box.querySelectorAll('[data-topen]').forEach(function(el){
+        el.onclick=function(ev){ev.stopPropagation();openEdit(el.dataset.topen,el.dataset.tname)};
+      });
       box.querySelectorAll('[data-shost]').forEach(function(el){
         el.onclick=function(){dmg.host=el.dataset.shost;dmg.editId='';renderAssetsPage()};
       });
