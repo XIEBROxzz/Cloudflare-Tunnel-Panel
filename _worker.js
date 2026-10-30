@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.2.0";
+const APP_VERSION = "2.2.1";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -999,7 +999,7 @@ async function handleApi(request, env, path) {
     return json({ zones });
   }
 
-  // /api/cdn: 每个 Zone 的 CDN 状态 (代理 DNS 数 / Origin 证书数 / Origin 规则数)
+  // /api/cdn: 逐个子域名判定 CF CDN (代理 DNS + Origin 规则 + Origin 证书), 再按 Zone 汇总
   if (path === "/api/cdn") {
     const zones = await listZones(env);
     const out = new Array(zones.length);
@@ -1008,8 +1008,9 @@ async function handleApi(request, env, path) {
       const batch = zones.slice(i, i + CONCURRENCY);
       const part = await Promise.all(batch.map(async (z) => {
         const zn = String(z.name || "").replace(/\.$/, "").toLowerCase();
+        const norm = (h) => String(h || "").replace(/\.$/, "").toLowerCase();
         const inZone = (h) => {
-          const n = String(h || "").replace(/\.$/, "").toLowerCase();
+          const n = norm(h);
           return !!n && (n === zn || n === "*." + zn || n.endsWith("." + zn));
         };
         const [recs, rules, certs] = await Promise.all([
@@ -1017,17 +1018,52 @@ async function handleApi(request, env, path) {
           originRules(env, z.id).catch(() => ({ rules: [] })),
           originCerts(env, z.id).catch(() => []),
         ]);
-        const proxied = recs.filter((r) => r.proxied === true).length;
-        const certCount = certs.filter((c) => (c.hostnames || []).some(inZone)).length;
-        const ruleCount = ((rules && rules.rules) || []).length;
+        const ruleExprs = ((rules && rules.rules) || []).map((r) => String(r.expression || "").toLowerCase());
+        const ruleCovers = (h) => ruleExprs.some((e) => {
+          const m = e.match(/https?\.host\s*(eq|contains|matches)\s*["']([^"']+)["']/);
+          if (!m) return false;
+          const v = norm(m[2]);
+          if (m[1] === "eq") return v === h;
+          if (m[1] === "contains") return !!v && h.indexOf(v) >= 0;
+          try { return new RegExp(v).test(h); } catch (err) { return false; }
+        });
+        const certHosts = [];
+        for (const c of certs) for (const h of (c.hostnames || [])) {
+          const n = norm(h);
+          if (inZone(n)) certHosts.push(n);
+        }
+
+        // 按 DNS 主机名聚合: 同一主机名有多条记录时, 只要有一条代理就算代理
+        const proxiedByHost = new Map();
+        let proxiedAll = 0;
+        for (const r of recs) {
+          const h = norm(r.name);
+          if (!inZone(h)) continue;
+          if (r.proxied === true) proxiedAll++;
+          proxiedByHost.set(h, (proxiedByHost.get(h) || false) || r.proxied === true);
+        }
+
+        const hosts = [];
+        for (const [h, proxied] of proxiedByHost) {
+          if (h === zn) continue; // 主域名不算子域名
+          const rule = ruleCovers(h);
+          const cert = certCovers(certHosts, h);
+          hosts.push({ host: h, dns: true, proxied: !!proxied, rule, cert, cdn: !!proxied && rule && cert });
+        }
+        hosts.sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
+        const cdnHosts = hosts.filter((x) => x.cdn).map((x) => x.host);
         return {
           id: z.id,
           name: z.name,
-          dns: recs.length,
-          proxied,
-          certs: certCount,
-          rules: ruleCount,
-          cdn: proxied > 0,
+          dns: recs.filter((r) => inZone(r.name)).length,
+          proxied: proxiedAll,
+          certs: certs.filter((c) => (c.hostnames || []).some(inZone)).length,
+          rules: ruleExprs.length,
+          subdomains: hosts.length,
+          cdnCount: cdnHosts.length,
+          cdnHosts: cdnHosts.slice(0, 5),
+          cdn: cdnHosts.length > 0,
+          hosts,
         };
       }));
       part.forEach((v, k) => { out[i + k] = v; });
@@ -1041,9 +1077,10 @@ async function handleApi(request, env, path) {
     const hostname = str(d.host);
     if (!hostname) {
       // 列出 Zone 上的全部子域名 (DNS 记录名去重 + 隧道路由域名去重)
-      const [recs, rules, ts] = await Promise.all([
-        cf(env, `/zones/${zone.id}/dns_records?per_page=100`).catch(() => []),
+      const [recs, rules, certs, ts] = await Promise.all([
+        listDnsRecords(env, zone.id).catch(() => []),
         originRules(env, zone.id),
+        originCerts(env, zone.id),
         tunnelRoutes(env, base, await listTunnels(env, base)),
       ]);
       const hosts = new Set();
@@ -1065,7 +1102,37 @@ async function handleApi(request, env, path) {
         if (inZone(h)) hosts.add(h);
       }
       hosts.delete(zn); // 主域名单独显示
-      return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name });
+
+      // 逐个主机名标记: 代理 DNS / Origin 规则 / Origin 证书, 三者齐才算 CF CDN
+      const proxiedByHost = new Map();
+      for (const r of recs) {
+        const h = norm(r.name);
+        if (!inZone(h)) continue;
+        proxiedByHost.set(h, (proxiedByHost.get(h) || false) || r.proxied === true);
+      }
+      const ruleExprs = rules.rules.map((r) => String(r.expression || "").toLowerCase());
+      const ruleCovers = (h) => ruleExprs.some((e) => {
+        const m = e.match(/https?\.host\s*(eq|contains|matches)\s*["']([^"']+)["']/);
+        if (!m) return false;
+        const v = norm(m[2]);
+        if (m[1] === "eq") return v === h;
+        if (m[1] === "contains") return !!v && h.indexOf(v) >= 0;
+        try { return new RegExp(v).test(h); } catch (err) { return false; }
+      });
+      const certHosts = [];
+      for (const c of certs) for (const h of (c.hostnames || [])) {
+        const n = norm(h);
+        if (inZone(n)) certHosts.push(n);
+      }
+      const flags = {};
+      for (const h of hosts) {
+        const proxied = proxiedByHost.get(h) === true;
+        const rule = ruleCovers(h);
+        const cert = certCovers(certHosts, h);
+        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied && rule && cert };
+      }
+
+      return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name, flags });
     }
     // 某个主机名下的全部关联资源
     const [recs, rules, certs, ts] = await Promise.all([
@@ -1705,6 +1772,8 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .dz-name{font-size:13.5px;word-break:break-all}
 .dz-meta{display:flex;flex-wrap:wrap;gap:3px 12px;margin-top:5px;font-size:11.5px;color:var(--sub)}
 .dz-meta .muted{opacity:.45}
+.dz-meta .pill{font-size:10.5px;padding:2px 7px}
+.dz-cdn{margin-top:5px;font-size:11.5px;color:#f6821f;word-break:break-all}
 .empty{color:var(--sub);font-size:14px;text-align:center;padding:18px 0}
 .hint{font-size:13px;color:var(--sub);margin:2px 0 6px;line-height:1.65}
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:8}
@@ -1804,7 +1873,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         </div>
         <div class="card">
           <h3><span>🌐 账号域名</span><span class="pill" id="dz_n">-</span></h3>
-          <div class="hint" style="margin:0 0 8px;font-size:12px">CF CDN = 该域名有代理 DNS；Origin 证书 / 规则用于辅助确认</div>
+          <div class="hint" style="margin:0 0 8px;font-size:12px">橙色 CF CDN = 子域名同时具备 代理 DNS + Origin 规则 + Origin 证书</div>
           <div id="dz_list"><div class="empty">加载中...</div></div>
         </div>
       </section>
@@ -2451,15 +2520,19 @@ async function loadDashZones(){
     $('dz_n').textContent=zs.length?('CF CDN '+cdnN+'/'+zs.length+' 个域名'):'0 个';
     $('dz_n').className='pill'+(cdnN?' cdn':'');
     b.innerHTML=zs.length?zs.map(function(z){
+      var hs=z.cdnHosts||[],cnt=z.cdnCount||0;
+      var more=cnt>hs.length?' +'+(cnt-hs.length):'';
       return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
         '<div class="dz-main">'+
           '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
-          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?'CF CDN':'未代理')+'</span></div>'+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?('CF CDN '+cnt+' 个子域名'):'无 CDN 子域名')+'</span></div>'+
           '<div class="dz-meta">'+
             '<span>DNS 代理 '+z.proxied+'/'+z.dns+'</span>'+
             '<span'+(z.certs?'':' class="muted"')+'>Origin 证书 '+z.certs+'</span>'+
             '<span'+(z.rules?'':' class="muted"')+'>Origin 规则 '+z.rules+'</span>'+
+            '<span'+(z.subdomains?'':' class="muted"')+'>子域名 '+(z.subdomains||0)+'</span>'+
           '</div>'+
+          (hs.length?'<div class="dz-cdn">✅ '+hs.map(esc).join(' · ')+more+'</div>':'')+
         '</div>'+
         '<span class="btn sm" style="flex:none">管理 →</span></div>';
     }).join(''):'<div class="empty">当前账号下没有可用域名</div>';
@@ -2485,7 +2558,7 @@ async function renderAssetsPage(){
           '<strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
           '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div>';
       }).join('')+'</div>';
-      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。</div>';
+      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名同时具备 代理 DNS + Origin 规则 + Origin 证书。</div>';
       box.innerHTML=h;
       $('p_r').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
       box.querySelectorAll('[data-azone]').forEach(function(el){
@@ -2502,8 +2575,14 @@ async function renderAssetsPage(){
       h+='<div class="acc-item" style="cursor:pointer" data-shost="'+esc(zoneName)+'"><strong>🏠 主域名</strong><span style="margin-left:auto;color:var(--sub)">点击查看关联资源</span></div>';
       if(d.hosts.length){
         h+=d.hosts.map(function(x){
+          var fl=(d.flags||{})[x]||{};
+          var tags='<span class="pill '+(fl.dns?(fl.proxied?'on':'warn'):'off')+'">'+(fl.dns?(fl.proxied?'DNS 代理':'DNS 仅解析'):'无 DNS')+'</span>'+
+            '<span class="pill '+(fl.rule?'on':'')+'">规则 '+(fl.rule?'✓':'✗')+'</span>'+
+            '<span class="pill '+(fl.cert?'on':'')+'">证书 '+(fl.cert?'✓':'✗')+'</span>'+
+            (fl.cdn?'<span class="pill cdn">CF CDN</span>':'');
           return '<div class="acc-item" style="cursor:pointer" data-shost="'+esc(x)+'">'+
-            '<strong style="min-width:0;word-break:break-all">'+esc(x)+'</strong>'+
+            '<div class="dz-main"><strong style="min-width:0;word-break:break-all">'+esc(x)+'</strong>'+
+            '<div class="dz-meta" style="gap:5px">'+tags+'</div></div>'+
             '<span style="margin-left:auto;display:flex;gap:6px;flex:none">'+
             '<button class="btn sm red" style="flex:none" data-clean="'+esc(x)+'">清理</button>'+
             '<button class="btn sm" style="flex:none" data-shostbtn="'+esc(x)+'">详情 →</button></span></div>';
