@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.1.1";
+const APP_VERSION = "2.2.0";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -114,6 +114,17 @@ async function listZones(env) {
     const r = await cf(env, `/zones?per_page=50&page=${page}&status=active`);
     all.push(...r.map((z) => ({ id: z.id, name: z.name })));
     if (r.length < 50) break;
+  }
+  return all;
+}
+
+// 列出某 Zone 的全部 DNS 记录 (分页, 最多 5 页 = 500 条, 足够统计)
+async function listDnsRecords(env, zoneId) {
+  const all = [];
+  for (let page = 1; page <= 5; page++) {
+    const r = await cf(env, `/zones/${zoneId}/dns_records?per_page=100&page=${page}`);
+    all.push(...r);
+    if (r.length < 100) break;
   }
   return all;
 }
@@ -988,6 +999,42 @@ async function handleApi(request, env, path) {
     return json({ zones });
   }
 
+  // /api/cdn: 每个 Zone 的 CDN 状态 (代理 DNS 数 / Origin 证书数 / Origin 规则数)
+  if (path === "/api/cdn") {
+    const zones = await listZones(env);
+    const out = new Array(zones.length);
+    const CONCURRENCY = 4; // 分批请求, 避免一次性打满 CF API 速率限制
+    for (let i = 0; i < zones.length; i += CONCURRENCY) {
+      const batch = zones.slice(i, i + CONCURRENCY);
+      const part = await Promise.all(batch.map(async (z) => {
+        const zn = String(z.name || "").replace(/\.$/, "").toLowerCase();
+        const inZone = (h) => {
+          const n = String(h || "").replace(/\.$/, "").toLowerCase();
+          return !!n && (n === zn || n === "*." + zn || n.endsWith("." + zn));
+        };
+        const [recs, rules, certs] = await Promise.all([
+          listDnsRecords(env, z.id).catch(() => []),
+          originRules(env, z.id).catch(() => ({ rules: [] })),
+          originCerts(env, z.id).catch(() => []),
+        ]);
+        const proxied = recs.filter((r) => r.proxied === true).length;
+        const certCount = certs.filter((c) => (c.hostnames || []).some(inZone)).length;
+        const ruleCount = ((rules && rules.rules) || []).length;
+        return {
+          id: z.id,
+          name: z.name,
+          dns: recs.length,
+          proxied,
+          certs: certCount,
+          rules: ruleCount,
+          cdn: proxied > 0,
+        };
+      }));
+      part.forEach((v, k) => { out[i + k] = v; });
+    }
+    return json({ zones: out });
+  }
+
   // /api/asset: 某 Zone 下的子域名列表 (host 为空) 或某子域名的全部关联资源
   if (path === "/api/asset") {
     const zone = await cf(env, `/zones/${str(d.zoneId)}`);
@@ -1651,6 +1698,13 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .pill.on{color:var(--ok);border-color:rgba(34,160,107,.4)}
 .pill.off{color:var(--bad);border-color:rgba(217,63,63,.35)}
 .pill.warn{color:var(--warn);border-color:rgba(232,163,23,.4)}
+.pill.cdn{color:#f6821f;border-color:rgba(246,130,31,.45);background:rgba(246,130,31,.12)}
+.acc-item.dz{align-items:flex-start}
+.acc-item.dz .dz-main{min-width:0;flex:1}
+.dz-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.dz-name{font-size:13.5px;word-break:break-all}
+.dz-meta{display:flex;flex-wrap:wrap;gap:3px 12px;margin-top:5px;font-size:11.5px;color:var(--sub)}
+.dz-meta .muted{opacity:.45}
 .empty{color:var(--sub);font-size:14px;text-align:center;padding:18px 0}
 .hint{font-size:13px;color:var(--sub);margin:2px 0 6px;line-height:1.65}
 .mask{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;z-index:8}
@@ -1750,6 +1804,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
         </div>
         <div class="card">
           <h3><span>🌐 账号域名</span><span class="pill" id="dz_n">-</span></h3>
+          <div class="hint" style="margin:0 0 8px;font-size:12px">CF CDN = 该域名有代理 DNS；Origin 证书 / 规则用于辅助确认</div>
           <div id="dz_list"><div class="empty">加载中...</div></div>
         </div>
       </section>
@@ -2390,17 +2445,28 @@ $('p_save').onclick=async function(){
 async function loadDashZones(){
   var b=$('dz_list');
   try{
-    var d=await api('/api/assets');
-    $('dz_n').textContent=d.zones.length?('共 '+d.zones.length+' 个'):'0 个';
-    b.innerHTML=d.zones.length?d.zones.map(function(z){
-      return '<div class="acc-item" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
-        '<div style="display:flex;align-items:center;gap:8px"><strong style="font-size:13.5px">🌐 '+esc(z.name)+'</strong>'+
-        '<span style="margin-left:auto" class="btn sm">管理 →</span></div></div>';
+    var d=await api('/api/cdn');
+    var zs=d.zones||[];
+    var cdnN=zs.filter(function(z){return z.cdn}).length;
+    $('dz_n').textContent=zs.length?('CF CDN '+cdnN+'/'+zs.length+' 个域名'):'0 个';
+    $('dz_n').className='pill'+(cdnN?' cdn':'');
+    b.innerHTML=zs.length?zs.map(function(z){
+      return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
+        '<div class="dz-main">'+
+          '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'">'+(z.cdn?'CF CDN':'未代理')+'</span></div>'+
+          '<div class="dz-meta">'+
+            '<span>DNS 代理 '+z.proxied+'/'+z.dns+'</span>'+
+            '<span'+(z.certs?'':' class="muted"')+'>Origin 证书 '+z.certs+'</span>'+
+            '<span'+(z.rules?'':' class="muted"')+'>Origin 规则 '+z.rules+'</span>'+
+          '</div>'+
+        '</div>'+
+        '<span class="btn sm" style="flex:none">管理 →</span></div>';
     }).join(''):'<div class="empty">当前账号下没有可用域名</div>';
     b.querySelectorAll('[data-dzid]').forEach(function(el){
       el.onclick=function(){showDomainsPage(el.dataset.dzid,el.dataset.dzname,'')};
     });
-  }catch(e){b.innerHTML='<div class="empty">加载失败</div>';$('dz_n').textContent=''}
+  }catch(e){b.innerHTML='<div class="empty">加载失败</div>';$('dz_n').textContent='';$('dz_n').className='pill'}
 }
 
 // 页面版域名管理: 域名 → 子域名 → 详情 (DNS 增删改 / Origin 规则 / 证书 / 关联隧道)
