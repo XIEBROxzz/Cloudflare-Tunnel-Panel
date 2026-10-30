@@ -941,6 +941,20 @@ async function handleApi(request, env, path) {
       return [];
     }
   }
+  // 证书是否覆盖某个主机名: 精确匹配, 或 *.example.com 这类一级通配
+  const certCovers = (hostnames, host) => {
+    const h = String(host || "").toLowerCase();
+    if (!h) return false;
+    return (hostnames || []).some((x) => {
+      const n = String(x || "").toLowerCase();
+      if (!n) return false;
+      if (n === h) return true;
+      if (!n.startsWith("*.")) return false;
+      const suffix = n.slice(1); // "*.example.com" → ".example.com"
+      const left = h.slice(0, h.length - suffix.length);
+      return h.endsWith(suffix) && left.length > 0 && left.indexOf(".") < 0;
+    });
+  };
   // 表达式里是否出现指定主机名 (http.host eq "a.b.com" / contains 等)
   const exprHas = (expr, host) => {
     const e = String(expr || "").toLowerCase();
@@ -1001,7 +1015,7 @@ async function handleApi(request, env, path) {
       rulesetId: rules.rulesetId || "",
       dns: (recs || []).map((r) => ({ id: r.id, type: r.type, name: r.name, content: r.content, proxied: !!r.proxied, ttl: r.ttl })),
       originRules: rules.rules.filter((r) => exprHas(r.expression, hostname)),
-      certs: certs.filter((c) => (c.hostnames || []).some((h) => h === hostname || (hostname.endsWith("." + h) && h === zone.name) || h === zone.name)),
+      certs: certs.filter((c) => certCovers(c.hostnames, hostname)),
       tunnels: ts
         .map((t) => ({ id: t.id, name: t.name, status: t.status, routes: t.ingress.filter((r) => r.hostname === hostname) }))
         .filter((t) => t.routes.length),
@@ -1014,22 +1028,22 @@ async function handleApi(request, env, path) {
     const hostname = str(d.host);
     const kind = str(d.kind);
     const stat = { dns: 0, rules: 0, certs: 0, routes: 0, tunnels: 0, errors: [] };
-    const run = async (fn) => { try { await fn(); } catch (e) { stat.errors.push(String((e && e.message) || e)); } };
+    // 返回是否成功: 计数按单项结果累加, 不会因为前面某项失败而漏计后面的成功项
+    const run = async (fn) => {
+      try { await fn(); return true; } catch (e) { stat.errors.push(String((e && e.message) || e)); return false; }
+    };
 
     if (kind === "dns") { // 删除单条 DNS 记录
-      await run(() => cf(env, `/zones/${zoneId}/dns_records/${str(d.id)}`, "DELETE"));
-      if (!stat.errors.length) stat.dns = 1;
+      if (await run(() => cf(env, `/zones/${zoneId}/dns_records/${str(d.id)}`, "DELETE"))) stat.dns = 1;
       return json({ ok: !stat.errors.length, ...stat });
     }
     if (kind === "rule") { // 删除单条 Origin Rule
       const rulesetId = str(d.rulesetId);
-      await run(() => cf(env, `/zones/${zoneId}/rulesets/${rulesetId}/rules/${str(d.id)}`, "DELETE"));
-      if (!stat.errors.length) stat.rules = 1;
+      if (await run(() => cf(env, `/zones/${zoneId}/rulesets/${rulesetId}/rules/${str(d.id)}`, "DELETE"))) stat.rules = 1;
       return json({ ok: !stat.errors.length, ...stat });
     }
     if (kind === "cert") { // 删除单张 Origin 证书
-      await run(() => cf(env, `/certificates/${str(d.id)}`, "DELETE"));
-      if (!stat.errors.length) stat.certs = 1;
+      if (await run(() => cf(env, `/certificates/${str(d.id)}`, "DELETE"))) stat.certs = 1;
       return json({ ok: !stat.errors.length, ...stat });
     }
     if (kind === "route") { // 删除隧道上指向该域名的单条路由
@@ -1041,8 +1055,7 @@ async function handleApi(request, env, path) {
       ingress.splice(idx, 1);
       if (ingress.some((r) => r.hostname) && !ingress.some((r) => !r.hostname && !r.path))
         ingress.push({ service: "http_status:404" });
-      await run(() => cf(env, `${base}/${tid}/configurations`, "PUT", { config: { ...config, ingress } }));
-      if (!stat.errors.length) {
+      if (await run(() => cf(env, `${base}/${tid}/configurations`, "PUT", { config: { ...config, ingress } }))) {
         stat.routes = 1;
         const others = await tunnelRoutes(env, base, [{ id: tid }]); // 没有别的路由再用该域名才清理 DNS
         const stillUsed = (others[0] && others[0].ingress || []).some((r) => r.hostname === hostname);
@@ -1052,11 +1065,8 @@ async function handleApi(request, env, path) {
           if (clean.dnsFailed) stat.errors.push("DNS 清理失败: " + clean.dnsErr);
         }
         if (!ingress.some((r) => r.hostname)) { // 隧道再无任何域名路由, 视为可整条删除
-          await run(async () => {
-            await cf(env, `${base}/${tid}/connections`, "DELETE");
-            await cf(env, `${base}/${tid}`, "DELETE");
-            stat.tunnels = 1;
-          });
+          await cf(env, `${base}/${tid}/connections`, "DELETE").catch(() => {}); // 连接清理失败不阻断隧道删除
+          if (await run(() => cf(env, `${base}/${tid}`, "DELETE"))) stat.tunnels = 1;
         }
       }
       return json({ ok: !stat.errors.length, ...stat });
@@ -1071,9 +1081,8 @@ async function handleApi(request, env, path) {
             hosts = ((c && c.config && c.config.ingress) || []).map((r) => r.hostname).filter(Boolean);
           } catch (e) {}
         }
-        await run(() => cf(env, `${base}/${tid}/connections`, "DELETE"));
-        await run(() => cf(env, `${base}/${tid}`, "DELETE"));
-        if (!stat.errors.length) {
+        await cf(env, `${base}/${tid}/connections`, "DELETE").catch(() => {}); // 连接清理失败不阻断隧道删除
+        if (await run(() => cf(env, `${base}/${tid}`, "DELETE"))) {
           stat.tunnels = 1;
           const clean = await cleanDns(env, tid, hosts);
           stat.dns = clean.dns;
@@ -1089,16 +1098,18 @@ async function handleApi(request, env, path) {
         originCerts(env, zoneId),
         tunnelRoutes(env, base, await listTunnels(env, base)),
       ]);
-      for (const r of (recs || [])) await run(() => cf(env, `/zones/${zoneId}/dns_records/${r.id}`, "DELETE")).then(() => { if (!stat.errors.length) stat.dns++; });
+      const hLow = hostname.toLowerCase();
+      for (const r of (recs || [])) if (await run(() => cf(env, `/zones/${zoneId}/dns_records/${r.id}`, "DELETE"))) stat.dns++;
       const matched = rules.rules.filter((r) => exprHas(r.expression, hostname));
       for (const r of matched) {
         if (!rules.rulesetId) break;
-        await run(() => cf(env, `/zones/${zoneId}/rulesets/${rules.rulesetId}/rules/${r.id}`, "DELETE")).then(() => { if (!stat.errors.length) stat.rules++; });
+        if (await run(() => cf(env, `/zones/${zoneId}/rulesets/${rules.rulesetId}/rules/${r.id}`, "DELETE"))) stat.rules++;
       }
       if (d.cert !== false) for (const c of certs) {
-        if (!(c.hostnames || []).some((h) => h === hostname || h === zone.name)) continue;
-        if (c.hostnames.length > 1 && c.hostnames.some((h) => h !== hostname && h !== zone.name)) continue; // 多域名共用证书不删
-        await run(() => cf(env, `/certificates/${c.id}`, "DELETE")).then(() => { if (!stat.errors.length) stat.certs++; });
+        if (!certCovers(c.hostnames, hostname)) continue;
+        // 只删专属于该主机名的证书: 证书里还列着别的域名(共用或上级域)就保留, 避免误删主域名证书
+        if ((c.hostnames || []).some((h) => String(h).toLowerCase() !== hLow)) continue;
+        if (await run(() => cf(env, `/certificates/${c.id}`, "DELETE"))) stat.certs++;
       }
       for (const t of ts) {
         const routes = t.ingress.filter((r) => r.hostname === hostname);
@@ -1106,10 +1117,8 @@ async function handleApi(request, env, path) {
         const { config, ingress } = await getRules(env, base, t.id);
         if (ingress.filter((r) => r.hostname).length <= routes.length) {
           // 该隧道只有这一个域名 → 整条删除
-          await run(async () => {
-            await cf(env, `${base}/${t.id}/connections`, "DELETE");
-          });
-          await run(() => cf(env, `${base}/${t.id}`, "DELETE")).then(() => { if (!stat.errors.length) stat.tunnels++; });
+          await cf(env, `${base}/${t.id}/connections`, "DELETE").catch(() => {}); // 连接清理失败不阻断隧道删除
+          if (await run(() => cf(env, `${base}/${t.id}`, "DELETE"))) stat.tunnels++;
         } else {
           let g = ingress.slice();
           for (const r of routes) {
@@ -1117,7 +1126,7 @@ async function handleApi(request, env, path) {
             if (i >= 0) g.splice(i, 1);
           }
           if (g.some((r) => r.hostname) && !g.some((r) => !r.hostname && !r.path)) g.push({ service: "http_status:404" });
-          await run(() => cf(env, `${base}/${t.id}/configurations`, "PUT", { config: { ...config, ingress: g } })).then(() => { if (!stat.errors.length) stat.routes += routes.length; });
+          if (await run(() => cf(env, `${base}/${t.id}/configurations`, "PUT", { config: { ...config, ingress: g } }))) stat.routes += routes.length;
         }
       }
       const clean = await cleanDns(env, "", [hostname]); // 兜底: 清掉残余的隧道 CNAME
