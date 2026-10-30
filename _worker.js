@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.2.4";
+const APP_VERSION = "2.3.0";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -841,7 +841,7 @@ async function handleApi(request, env, path) {
   // ---- 多账号解析: env.cfAcc 是前端本次请求选择的账号 ID ----
   // 无 KV / 未选 / 选择不存在时, 回退到 env 配置的默认账号 (cf() 里 token 同理)
   const meta0 = store(env) ? await getMeta(env) : { accounts: [] };
-  const actx = pickAccount(meta0, env, env.cfAcc);
+  const actx = pickAccount(meta0, env, env.cfAcc || meta0.curAcc);
   if (!actx) return json({ error: "未配置任何 Cloudflare 账号 (环境变量或面板多账号管理)" }, 500);
   // 账号专属认证: Token 账号用 Bearer; Global Key 账号用邮箱+密钥 (cf() 里按 cfEmail/cfKey 走 X-Auth 头)
   if (actx.key) {
@@ -870,10 +870,31 @@ async function handleApi(request, env, path) {
     const meta = await getMeta(env);
     const action = str(d.action);
     if (action === "list") {
+      const list = accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" }));
+      // cur 必须是"已保存的选择": 否则前端每次打开都会退回列表第一个
+      const curId = list.some((a) => a.acc === meta.curAcc) ? meta.curAcc : acc;
       return json({
-        accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })),
-        cur: acc,
+        accounts: list,
+        cur: curId,
         persistent: !!store(env),
+      });
+    }
+    if (action === "default") {
+      requireKv(env);
+      const accId = str(d.acc);
+      if (!accountList(meta, env).some((a) => a.acc === accId)) return json({ error: "账号不存在" }, 400);
+      meta.curAcc = accId; // 记住默认账号
+      // 把该账号移到列表首位 (环境变量默认账号固定在最前, 不参与排序)
+      const idx = meta.accounts.findIndex((a) => str(a.acc) === accId);
+      if (idx > 0) {
+        const picked = meta.accounts.splice(idx, 1)[0];
+        meta.accounts.unshift(picked);
+      }
+      await saveMeta(env, meta);
+      return json({
+        ok: true,
+        cur: accId,
+        accounts: accountList(meta, env).map((a) => ({ name: a.name, acc: a.acc, builtin: !!a.builtin, auth: a.authType || "token" })),
       });
     }
     if (action === "add") {
@@ -2042,7 +2063,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
     <label>该账户的 Global API Key (全权限)</label>
     <input id="am_key" placeholder="My Profile → API Keys → Global API Key, 粘贴后点添加" autocapitalize="off" autocomplete="off" spellcheck="false">
     <div class="btns" style="margin-top:12px"><button class="btn" id="am_add">添加账号</button></div>
-    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥只存 KV, 不会下发到页面。所有账号都可用自定名字, 也都可删除; 环境变量默认账号删除后就不再出现, 想继续用它就在此填回它的账户 ID+邮箱+密钥 (名字随意)。</div>
+    <div class="hint" style="margin-top:8px">验证通过才保存; 密钥只存 KV, 不会下发到页面。点「设为默认」会记住该账号并置顶, 下次打开面板直接用它; 切换账号下拉也会记住上次选择。所有账号都可用自定名字, 也都可删除; 环境变量默认账号删除后就不再出现, 想继续用它就在此填回它的账户 ID+邮箱+密钥 (名字随意)。</div>
   </div>
 </div>
 
@@ -2216,18 +2237,25 @@ $('acc_sel').addEventListener('change',async function(){
   loadMeta();
 });
 $('acc_mgr').onclick=function(){openAccMgr()};
+function accMgrHtml(items,cur){
+  return (items||[]).map(function(a){
+    var isDef=a.acc===cur;
+    return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
+      (isDef?' <span class="pill on" style="font-size:10.5px;padding:1px 7px">默认</span>':'')+
+      '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
+      '<div style="display:flex;gap:6px;flex:none;align-items:center">'+
+      (isDef?'':'<button class="btn sm" data-amdef="'+esc(a.acc)+'">设为默认</button>')+
+      '<button class="btn sm red" data-amdel="'+esc(a.acc)+'" title="'+(a.builtin?'删除后请用下方表单以自定义名字重新添加':'删除该账号')+'">删除</button>'+
+      '</div></div>';
+  }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
+}
 async function openAccMgr(){
   var b=$('am_body');
   b.innerHTML='<div class="empty">加载中...</div>';
   openModal('mAccMgr');
   try{
     var d=await api('/api/acc',{action:'list'});
-    b.innerHTML=(d.accounts||[]).map(function(a){
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
-        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'" title="'+(a.builtin?'删除后请用下方表单以自定义名字重新添加':'删除该账号')+'">删除</button>'+
-        '</div>';
-    }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
+    b.innerHTML=accMgrHtml(d.accounts,d.cur);
   }catch(e){b.innerHTML='<div class="empty">加载失败</div>';fail(e)}
 }
 $('am_add').onclick=async function(){
@@ -2241,13 +2269,8 @@ $('am_add').onclick=async function(){
     $('am_name').value='';$('am_acc').value='';$('am_email').value='';$('am_key').value='';
     toast('账号已添加: '+name);
     var items=d.accounts||[];accNames={};
-    $('am_body').innerHTML=items.map(function(a){
-      accNames[a.acc]=a.name;
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
-        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>'+
-        '</div>';
-    }).join('');
+    items.forEach(function(a){accNames[a.acc]=a.name});
+    $('am_body').innerHTML=accMgrHtml(items,curAcc);
     renderAccSel({accounts:items,cur:curAcc});
   }catch(e){fail(e)}
   b.disabled=false;b.innerHTML='添加账号';
@@ -2259,13 +2282,8 @@ document.addEventListener('click',async function(e){
     var d=await api('/api/acc',{action:'del',acc:t.dataset.amdel});
     toast('已删除');
     var items=d.accounts||[];accNames={};
-    $('am_body').innerHTML=items.map(function(a){
-      accNames[a.acc]=a.name;
-      return '<div class="am-item"><div style="min-width:0"><b>'+esc(a.name)+'</b>'+
-        '<div style="font-size:11px;color:var(--sub)">'+esc(a.acc)+(a.builtin?' · 环境变量配置':' · 邮箱+Global Key')+'</div></div>'+
-        '<button class="btn sm red" data-amdel="'+esc(a.acc)+'">删除</button>'+
-        '</div>';
-    }).join('')||'<div class="empty">暂无账号, 请在下方添加</div>';
+    items.forEach(function(a){accNames[a.acc]=a.name});
+    $('am_body').innerHTML=accMgrHtml(items,curAcc);
     // 删除的是当前账号 (或其已不存在) → 自动切到剩余账号里的第一个, 重新加载列表/域名/提醒
     if(curAcc===t.dataset.amdel||!items.some(function(a){return a.acc===curAcc})){
       var fallback=items.find(function(a){return a.builtin})||items[0];
@@ -2281,6 +2299,27 @@ document.addEventListener('click',async function(e){
       renderAccSel({accounts:items,cur:curAcc});
     }
   }catch(e){fail(e)}
+});
+document.addEventListener('click',async function(e){
+  var t=e.target.closest('[data-amdef]');if(!t)return;
+  if(t.disabled)return;
+  t.disabled=true;
+  try{
+    var d=await api('/api/acc',{action:'default',acc:t.dataset.amdef});
+    curAcc=d.cur||t.dataset.amdef;
+    var items=d.accounts||[];
+    accNames={};items.forEach(function(a){accNames[a.acc]=a.name});
+    $('am_body').innerHTML=accMgrHtml(items,curAcc);
+    renderAccSel({accounts:items,cur:curAcc});
+    setBusy(true,'切换默认账号...');
+    try{
+      metaCache={};dmg.zone='';dmg.host='';dmg.zoneName='';
+      await Promise.all([loadList(),initZones()]);
+    }finally{setBusy(false)}
+    loadTg();loadMeta();
+    toast('已设为默认并置顶');
+  }catch(err){fail(err)}
+  t.disabled=false;
 });
 function show(v){
   document.querySelectorAll('.nav a').forEach(function(a){a.className=a.dataset.v===v?'on':''});
@@ -3067,7 +3106,7 @@ applyTheme(savedTheme);
 
 /* ---- 启动 ---- */
 show((location.hash||'').replace('#','')||'dash');
-initZones().catch(function(){}).then(loadAccs).then(function(){
+loadAccs().then(function(){return initZones().catch(function(){})}).then(function(){
   loadList().then(loadMeta);
   loadTg();
 });
