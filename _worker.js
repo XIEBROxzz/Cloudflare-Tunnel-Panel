@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.1.0";
+const APP_VERSION = "2.1.1";
 const BUILD_DATE = "2026-10-30";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -1000,13 +1000,24 @@ async function handleApi(request, env, path) {
         tunnelRoutes(env, base, await listTunnels(env, base)),
       ]);
       const hosts = new Set();
-      for (const r of recs) hosts.add(str(r.name));
+      // 只收集属于当前 Zone 的域名: 隧道/规则里可能引用账户下其他 Zone 的域名, 不能混进来
+      const zn = zone.name.toLowerCase();
+      const norm = (h) => str(h).replace(/\.$/, "").toLowerCase();
+      const inZone = (h) => h === zn || h.endsWith("." + zn);
+      for (const r of recs) {
+        const h = norm(r.name);
+        if (inZone(h)) hosts.add(h);
+      }
       for (const r of rules.rules) {
         const m = String(r.expression || "").match(/https?\.host\s*(?:eq|contains)\s*["']([^"']+)["']/i);
-        if (m) hosts.add(str(m[1]));
+        const h = m ? norm(m[1]) : "";
+        if (inZone(h)) hosts.add(h);
       }
-      for (const t of ts) for (const r of t.ingress) hosts.add(str(r.hostname));
-      hosts.delete(zone.name); // 主域名单独显示
+      for (const t of ts) for (const r of t.ingress) {
+        const h = norm(r.hostname);
+        if (inZone(h)) hosts.add(h);
+      }
+      hosts.delete(zn); // 主域名单独显示
       return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name });
     }
     // 某个主机名下的全部关联资源
