@@ -35,6 +35,13 @@ const CONFIG_DEFAULTS = {
 };
 // ====================================================================
 
+// ============================ 版本信息 ============================
+// 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
+const APP_VERSION = "2.1.0";
+const BUILD_DATE = "2026-10-30";
+const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
+// ====================================================================
+
 // 参数处理
 function applyConfig(env) {
   const out = Object.assign({}, env);
@@ -1169,7 +1176,7 @@ async function handleApi(request, env, path) {
   }
 
   if (path === "/api/init")
-    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "", me: sUser });
+    return json({ zones: await listZones(env), service: env.DEFAULT_SERVICE || "", cur: acc, envAcc: env.CF_ACCOUNT_ID || "", me: sUser, version: APP_VERSION, build: BUILD_DATE });
 
   if (path === "/api/create") {
     const name = str(d.name), service = str(d.service);
@@ -1386,6 +1393,9 @@ export default {
     const path = url.pathname;
     const isApi = path.startsWith("/api/");
 
+    if (path === "/api/version" && (request.method === "GET" || request.method === "HEAD"))
+      return json({ ok: true, version: APP_VERSION, build: BUILD_DATE, tag: VERSION_TAG });
+
     if (request.method === "POST" && isApi) {
       try {
         return await handleApi(request, env, path);
@@ -1449,6 +1459,7 @@ button.oks{opacity:1;background:linear-gradient(135deg,#17a35f,#2ecc7d);box-shad
 .foot{margin-top:22px;font-size:11.5px;display:flex;align-items:center;justify-content:center}
 .foot a{color:#5b6270;text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .15s}
 .foot a:hover{color:#8b93a0}
+.ver{margin-top:8px;font-size:11px;color:#5b6270;letter-spacing:.3px;text-align:center}
 .foot svg{width:14px;height:14px;opacity:.55}
 @media(prefers-color-scheme:light){
   body{background-image:radial-gradient(900px 480px at 18% -8%,rgba(246,130,31,.14),transparent 60%),radial-gradient(760px 420px at 88% 108%,rgba(246,130,31,.08),transparent 60%),linear-gradient(180deg,#f7f4ef 0%,#eef0f4 100%)}
@@ -1473,6 +1484,7 @@ button.oks{opacity:1;background:linear-gradient(135deg,#17a35f,#2ecc7d);box-shad
     <button id="go" type="submit">登 录</button>
     <div class="err" id="err"></div>
     <div class="foot"><a href="https://github.com/XIEBROxzz/Cloudflare-Tunnel-Panel" target="_blank" rel="noopener noreferrer">${CF_LOGO} Cloudflare Tunnel Panel</a></div>
+    <div class="ver">${VERSION_TAG}</div>
   </form>
 </div>
 <script>
@@ -1537,6 +1549,7 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang 
 .sidenav .foot a:hover{background:var(--side2);color:#e05252}
 .sidenav .foot a:hover .i{color:#e05252}
 .sidenav .foot a:hover .lo{opacity:1;transform:none}
+.sidenav .foot .ver{margin-top:6px;padding:0 8px;font-size:11px;opacity:.7;letter-spacing:.3px}
 .am-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--in)}
 .acc-list{display:block}
 .acc-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;background:var(--in)}
@@ -1695,7 +1708,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
       <a data-v="domains"><span class="i">🌐</span>域名管理</a>
       <a data-v="tg"><span class="i">✈️</span>Telegram 配置</a>
     </nav>
-    <div class="foot"><a href="#" id="logout"><span class="i">👤</span><span class="lt">退出登录</span><span class="lo">⇥</span></a></div>
+    <div class="foot"><a href="#" id="logout"><span class="i">👤</span><span class="lt">退出登录</span><span class="lo">⇥</span></a><div class="ver" title="面板版本">${VERSION_TAG}</div></div>
   </aside>
 
   <div class="main">
