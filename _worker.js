@@ -37,8 +37,8 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.3.0";
-const BUILD_DATE = "2026-10-30";
+const APP_VERSION = "2.3.1";
+const BUILD_DATE = "2026-11-06";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
 
@@ -586,8 +586,11 @@ function requireKv(env) {
 //   tunnel:state:<acc>:<id>  { on: 上次记录的状态, at: 时间 } (按账号隔离)
 //   watch:<签名>              { at: 上次检查时间 }
 // 与上次记录相比发生变化才提醒; 提醒前先写入新状态, 所以同一次变化只会提醒一次。
-const isUp = (t) => t.status === "healthy";
-const ST_TEXT = { healthy: "在线", degraded: "降级", down: "离线", inactive: "未启用" };
+// degraded 官方定义: "active and able to serve traffic but in an unhealthy state"
+// 即仍有连接到 CF 边缘、仍能服务流量, 只是冗余不足。因此与 healthy 一样按"在线"计,
+// 避免"业务明明是通的却显示离线 / 误发离线提醒"。徽章仍保留降级提示。
+const isUp = (t) => t.status === "healthy" || t.status === "degraded";
+const ST_TEXT = { healthy: "在线", degraded: "在线·降级", down: "离线", inactive: "未启用" };
 
 const fmtT = (ms, tz = 8) => {
   const d = new Date(ms + tz * 3600 * 1000);
@@ -1152,7 +1155,7 @@ async function handleApi(request, env, path) {
         const h = norm(r.hostname);
         if (!inZone(h)) continue;
         if (!tunnelByHost.has(h)) tunnelByHost.set(h, []);
-        tunnelByHost.get(h).push({ id: t.id, name: t.name, status: t.status });
+        tunnelByHost.get(h).push({ id: t.id, name: t.name, status: t.status, up: isUp(t) });
       }
       for (const h of hosts) {
         const proxied = proxiedByHost.get(h) === true;
@@ -1179,7 +1182,7 @@ async function handleApi(request, env, path) {
       originRules: rules.rules.filter((r) => exprHas(r.expression, hostname)),
       certs: certs.filter((c) => certCovers(c.hostnames, hostname)),
       tunnels: ts
-        .map((t) => ({ id: t.id, name: t.name, status: t.status, routes: t.ingress.filter((r) => r.hostname === hostname) }))
+        .map((t) => ({ id: t.id, name: t.name, status: t.status, up: isUp(t), routes: t.ingress.filter((r) => r.hostname === hostname) }))
         .filter((t) => t.routes.length),
     });
   }
@@ -2338,7 +2341,8 @@ $('logout').onclick=async function(e){
 document.querySelectorAll('.view').forEach(function(s){s.addEventListener('click',function(){$('sidenav').className='sidenav'})});
 
 /* ---- 仪表板 ---- */
-var stText={healthy:'在线',degraded:'降级',down:'离线',inactive:'未启用'};
+var stText={healthy:'在线',degraded:'在线·降级',down:'离线',inactive:'未启用'};
+function isOnline(t){return t&&(t.up===true||t.status==='healthy'||t.status==='degraded');}
 function durShort(ms){
   var m=Math.floor(ms/60000);
   if(m<1)return '<1m';
@@ -2389,7 +2393,7 @@ function renderList(){
     var on=allAlertOn[t.id]===true,m=metaCache[t.id]||{};
     // 在线徽章附带运行时长 (随 /api/list 的 conns_active_at 下发, 实时计算)
     var badgeTxt=stText[t.status]||t.status;
-    if(t.status==='healthy'&&upTs[t.id])badgeTxt+=' '+durShort(Date.now()-upTs[t.id]);
+    if(isOnline(t)&&upTs[t.id])badgeTxt+=' '+durShort(Date.now()-upTs[t.id]);
     var rules=(m.routes&&m.routes.length?m.routes:(m.hostname?[{hostname:m.hostname,path:m.path||'',service:m.service||''}]:[]));
     // routes===null 表示还没拉到或拉取失败, 显示"加载中"而不是误导性的"未配置域名"
     var routeLines=(m.routes===null&&(!rules||!rules.length))
@@ -2508,7 +2512,7 @@ async function initZones(){
   }
 }
 /* ---- 域名管理 (侧栏页面版 + 顶栏📂弹窗入口) ---- */
-var ST_TXT={healthy:'在线',degraded:'降级',down:'离线',inactive:'未启用'};
+var ST_TXT={healthy:'在线',degraded:'在线·降级',down:'离线',inactive:'未启用'};
 var DNS_TYPES=['A','AAAA','CNAME','TXT','MX','NS'];
 var dmg={zone:'',zoneName:'',host:'',busy:false,editId:''};
 
@@ -2639,7 +2643,7 @@ async function renderAssetsPage(){
           var tpill;
           if(tuns.length){
             var t0=tuns[0];
-            tpill='<span class="pill '+(t0.status==='healthy'?'on':'off')+'" data-topen="'+esc(t0.id)+'" data-tname="'+esc(t0.name)+'" title="点击打开隧道设置">🚇 '+esc(t0.name)+(tuns.length>1?' +'+(tuns.length-1):'')+'</span>';
+            tpill='<span class="pill '+(isOnline(t0)?'on':'off')+'" data-topen="'+esc(t0.id)+'" data-tname="'+esc(t0.name)+'" title="点击打开隧道设置">🚇 '+esc(t0.name)+(tuns.length>1?' +'+(tuns.length-1):'')+'</span>';
           }else tpill='<span class="pill" style="opacity:.55">无隧道</span>';
           var tags='<span class="pill '+(fl.dns?(fl.proxied?'on':'warn'):'off')+'">'+(fl.dns?(fl.proxied?'DNS 代理':'DNS 仅解析'):'无 DNS')+'</span>'+
             tpill+
@@ -2730,7 +2734,7 @@ async function renderAssetsPage(){
       var multied=t.routes.length===1&&!t.routes[0].path;
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px">'+
         '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><strong>'+esc(t.name)+'</strong>'+
-        '<em style="font-style:normal;color:'+(t.status==='healthy'?'var(--ok)':'var(--sub)')+';font-size:12.5px">'+(ST_TXT[t.status]||t.status)+'</em>'+
+        '<em style="font-style:normal;color:'+(isOnline(t)?'var(--ok)':'var(--sub)')+';font-size:12.5px">'+(ST_TXT[t.status]||t.status)+'</em>'+
         '<span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">'+
         '<button class="btn sm" data-gotun="'+esc(t.id)+'" data-goname="'+esc(t.name)+'">去隧道管理 →</button>'+
         (multied?'':'<button class="btn sm red" data-droute="'+esc(t.id)+'" data-path="'+esc(t.routes[0].path)+'">删此路由</button>')+
