@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.3.3";
+const APP_VERSION = "2.3.4";
 const BUILD_DATE = "2026-11-11";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -969,7 +969,15 @@ async function handleApi(request, env, path) {
   async function originRules(env, zoneId) {
     try {
       const rs = await cf(env, `/zones/${zoneId}/rulesets/phases/http_request_origin/entrypoint`);
-      return { rulesetId: rs.id || "", rules: (rs.rules || []).map((r) => ({ id: r.id, expression: r.expression || "", description: r.description || "", enabled: r.enabled !== false, version: r.version || "" })) };
+      // 保留 action / action_parameters: 回源端口 (origin.port) 就在这里, 面板需要显示并允许修改
+      return {
+        rulesetId: rs.id || "",
+        rules: (rs.rules || []).map((r) => ({
+          id: r.id, expression: r.expression || "", description: r.description || "",
+          enabled: r.enabled !== false, version: r.version || "",
+          action: r.action || "", actionParameters: r.action_parameters || null,
+        })),
+      };
     } catch (e) {
       return { rulesetId: "", rules: [] }; // 无规则或无权限时按空处理
     }
@@ -1226,6 +1234,58 @@ async function handleApi(request, env, path) {
       const rulesetId = str(d.rulesetId);
       if (await run(() => cf(env, `/zones/${zoneId}/rulesets/${rulesetId}/rules/${str(d.id)}`, "DELETE"))) stat.rules = 1;
       return json({ ok: !stat.errors.length, ...stat });
+    }
+    // 修改单条 Origin Rule 的回源端口 (Destination port): 只覆盖 origin.port, 保留其余 action_parameters
+    if (kind === "rulePort") {
+      const port = Number(d.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "回源端口需为 1-65535 的整数" }, 400);
+      const rulesetId = str(d.rulesetId), ruleId = str(d.id);
+      if (!rulesetId || !ruleId) return json({ error: "缺少规则 ID" }, 400);
+      const rs = await originRules(env, zoneId);
+      const r = rs.rules.find((x) => x.id === ruleId);
+      if (!r) return json({ error: "规则不存在或已被删除" }, 404);
+      const ap = r.actionParameters || {};
+      const body = {
+        action: r.action || "route",
+        action_parameters: { ...ap, origin: { ...(ap.origin || {}), port } },
+        expression: r.expression,
+        description: r.description,
+        enabled: r.enabled,
+      };
+      await cf(env, `/zones/${zoneId}/rulesets/${rulesetId}/rules/${ruleId}`, "PATCH", body);
+      return json({ ok: true, port });
+    }
+    // 为该子域名新建一条"指定回源端口"的 Origin Rule
+    if (kind === "ruleAdd") {
+      const port = Number(d.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) return json({ error: "回源端口需为 1-65535 的整数" }, 400);
+      const rs = await originRules(env, zoneId);
+      if (rs.rules.some((r) => exprHas(r.expression, hostname)))
+        return json({ error: "该域名已有 Origin 规则, 请直接修改端口" }, 400);
+      const rule = {
+        action: "route",
+        action_parameters: { origin: { port } },
+        expression: `http.host eq "${hostname.replace(/["\\]/g, "")}"`,
+        description: `回源端口 ${port} · ${hostname}`,
+        enabled: true,
+      };
+      let rulesetId = rs.rulesetId, id = "";
+      if (rulesetId) {
+        const created = await cf(env, `/zones/${zoneId}/rulesets/${rulesetId}/rules`, "POST", rule);
+        id = (created && created.id) || "";
+      } else {
+        // 该 Zone 还没有 http_request_origin 入口规则集, 创建时就带上第一条规则
+        const nrs = await cf(env, `/zones/${zoneId}/rulesets`, "POST", {
+          name: "default",
+          description: "Origin rules (created by Tunnel Panel)",
+          kind: "zone",
+          phase: "http_request_origin",
+          rules: [rule],
+        });
+        rulesetId = nrs.id || "";
+        id = (nrs.rules && nrs.rules[0] && nrs.rules[0].id) || "";
+      }
+      return json({ ok: true, rulesetId, id, port });
     }
     if (kind === "cert") { // 删除单张 Origin 证书
       if (await run(() => cf(env, `/certificates/${str(d.id)}`, "DELETE"))) stat.certs = 1;
@@ -2740,11 +2800,24 @@ async function renderAssetsPage(){
         '<button class="btn sm red" style="flex:none" data-ddns="'+esc(r.id)+'">删除</button></div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无</div>';
     h+='<div style="font-weight:600;margin:12px 0 6px">⚖️ Origin Rules 规则</div>';
+    h+='<div class="hint" style="margin:0 0 8px;font-size:12px">回源端口需与 VPS 对外监听端口一致; 只改 VPS 内部转发目标不用动这里。DNS 橙云代理下规则才生效。</div>';
     h+=nRules?d.originRules.map(function(r){
-      return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center">'+
-        '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px"><strong>'+esc(r.description||'规则 '+r.id.slice(0,6))+'</strong> '+esc(r.expression)+'</span>'+
-        '<button class="btn sm red" style="flex:none" data-drule="'+esc(r.id)+'" data-rset="'+esc(d.rulesetId||'')+'">删除</button></div></div>';
+      var ap=r.actionParameters||{},pt=(ap.origin&&ap.origin.port)||'';
+      return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
+        '<span style="min-width:0;flex:1;word-break:break-all;font-size:12.5px"><strong>'+esc(r.description||'规则 '+r.id.slice(0,6))+'</strong> '+esc(r.expression)+
+        '<br><span style="color:var(--sub)">回源端口: '+(pt?esc(String(pt)):'未指定 (默认 80/443)')+'</span></span>'+
+        '<button class="btn sm red" style="flex:none" data-drule="'+esc(r.id)+'" data-rset="'+esc(d.rulesetId||'')+'">删除</button></div>'+
+        '<div style="display:flex;gap:6px;align-items:center;margin-top:7px;flex-wrap:wrap">'+
+        '<span style="font-size:12px;color:var(--sub)">改回源端口</span>'+
+        '<input style="width:100px" type="number" min="1" max="65535" inputmode="numeric" value="'+esc(String(pt||''))+'" placeholder="8443" data-rport="'+esc(r.id)+'">'+
+        '<button class="btn sm" data-rsave="'+esc(r.id)+'" data-rset="'+esc(d.rulesetId||'')+'">保存</button></div></div>';
     }).join(''):'<div class="empty" style="padding:5px;font-size:12.5px">无</div>';
+    if(!nRules){
+      h+='<div style="display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap">'+
+        '<span style="font-size:12px;color:var(--sub)">为 '+esc(host)+' 新建回源端口规则</span>'+
+        '<input id="p_newport" style="width:100px" type="number" min="1" max="65535" inputmode="numeric" placeholder="8443">'+
+        '<button class="btn sm" id="p_radd">新建规则</button></div>';
+    }
     h+='<div style="font-weight:600;margin:12px 0 6px">🔐 Origin 证书</div>';
     h+=d.certs.length?d.certs.map(function(c){
       return '<div class="acc-item" style="padding:7px 10px;margin-bottom:6px"><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'+
@@ -2820,7 +2893,29 @@ async function renderAssetsPage(){
         renderAssetsPage();
       };
     });
-    // ---- Origin 规则 / 证书 ----
+    // ---- Origin 规则: 改回源端口 / 新建规则 / 删除 ----
+    box.querySelectorAll('[data-rsave]').forEach(function(b){
+      b.onclick=async function(){
+        var inp=box.querySelector('[data-rport="'+b.dataset.rsave+'"]');
+        var port=Number(inp&&inp.value);
+        if(!Number.isInteger(port)||port<1||port>65535){toast('端口需为 1-65535 的整数','err');return}
+        if(!await askConfirm('将该规则的回源端口改为 '+port+'? 必须与 VPS 对外监听端口一致, 改错会立即断流。','修改回源端口','保存'))return;
+        b.disabled=true;
+        try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'rulePort',id:b.dataset.rsave,rulesetId:b.dataset.rset,port:port});toast('回源端口已更新')}
+        catch(e){fail(e);b.disabled=false;return}
+        renderAssetsPage();
+      };
+    });
+    var radd=$('p_radd');
+    if(radd)radd.onclick=async function(){
+      var port=Number($('p_newport').value);
+      if(!Number.isInteger(port)||port<1||port>65535){toast('端口需为 1-65535 的整数','err');return}
+      if(!await askConfirm('为 '+host+' 新建回源端口 '+port+' 的 Origin 规则? 需先确认 VPS 已在该端口监听。','新建规则','新建'))return;
+      radd.disabled=true;
+      try{await api('/api/assetOp',{zoneId:zoneId,host:host,kind:'ruleAdd',port:port});toast('规则已创建')}
+      catch(e){fail(e);radd.disabled=false;return}
+      renderAssetsPage();
+    };
     box.querySelectorAll('[data-drule]').forEach(function(b){
       b.onclick=async function(){
         if(!await askConfirm('确定删除这条 Origin 规则?','删除规则','删除'))return;
