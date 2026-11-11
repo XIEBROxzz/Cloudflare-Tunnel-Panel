@@ -37,8 +37,8 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.3.1";
-const BUILD_DATE = "2026-11-06";
+const APP_VERSION = "2.3.2";
+const BUILD_DATE = "2026-11-11";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
 
@@ -1023,7 +1023,10 @@ async function handleApi(request, env, path) {
     return json({ zones });
   }
 
-  // /api/cdn: 逐个子域名判定 CF CDN (代理 DNS + Origin 规则 + Origin 证书), 再按 Zone 汇总
+  // /api/cdn: 逐个子域名判定 CF CDN (DNS 橙云代理), 再按 Zone 汇总
+  // 注意: 是否走 CDN 只取决于 DNS 记录是否开启代理 (proxied / 橙云)。
+  // Origin Rules 只是可选的回源端口/Host 改写, Origin CA 证书只是可选的源站证书;
+  // 直连 VPS 用 A/AAAA + 橙云即可套 CDN, 不需要这两样, 缺它们不代表没走 CDN。
   if (path === "/api/cdn") {
     const zones = await listZones(env);
     const out = new Array(zones.length);
@@ -1072,7 +1075,7 @@ async function handleApi(request, env, path) {
           if (h === zn) continue; // 主域名不算子域名
           const rule = ruleCovers(h);
           const cert = certCovers(certHosts, h);
-          hosts.push({ host: h, dns: true, proxied: !!proxied, rule, cert, cdn: !!proxied && rule && cert });
+          hosts.push({ host: h, dns: true, proxied: !!proxied, rule, cert, cdn: !!proxied, full: !!(proxied && rule && cert) });
         }
         hosts.sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
         const cdnHosts = hosts.filter((x) => x.cdn).map((x) => x.host);
@@ -1086,6 +1089,7 @@ async function handleApi(request, env, path) {
           subdomains: hosts.length,
           cdnCount: cdnHosts.length,
           cdnHosts: cdnHosts.slice(0, 5),
+          fullCount: hosts.filter((x) => x.full).length,
           cdn: cdnHosts.length > 0,
           hosts,
         };
@@ -1127,7 +1131,8 @@ async function handleApi(request, env, path) {
       }
       hosts.delete(zn); // 主域名单独显示
 
-      // 逐个主机名标记: 代理 DNS / Origin 规则 / Origin 证书, 三者齐才算 CF CDN
+      // 逐个主机名标记: 代理 DNS / Origin 规则 / Origin 证书
+      // CF CDN 只看 DNS 橙云代理; 规则与证书仅作为附加信息展示, 不作为门槛
       const proxiedByHost = new Map();
       for (const r of recs) {
         const h = norm(r.name);
@@ -1162,7 +1167,7 @@ async function handleApi(request, env, path) {
         const rule = ruleCovers(h);
         const cert = certCovers(certHosts, h);
         const tuns = tunnelByHost.get(h) || [];
-        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied && rule && cert, tunnels: tuns };
+        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied, full: proxied && rule && cert, tunnels: tuns };
       }
 
       return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name, flags });
@@ -2590,11 +2595,11 @@ async function loadDashZones(){
       return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
         '<div class="dz-main">'+
           '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
-          '<span class="pill '+(z.cdn?'cdn':'off')+'" title="代理 DNS（橙云）+ Origin 规则 + Origin 证书">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'" title="DNS 橙云代理：流量经 Cloudflare CDN；其中 '+(z.fullCount||0)+' 个子域名同时具备 Origin 规则 + Origin 证书">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
           subs+
         '</div>'+
         '<span class="btn sm" style="flex:none">管理 →</span></div>';
-    }).join(''):'<div class="empty">暂无命中 CF CDN 的域名<br><span style="font-size:12px">需同时具备 代理 DNS + Origin 规则 + Origin 证书</span></div>';
+    }).join(''):'<div class="empty">暂无命中 CF CDN 的域名<br><span style="font-size:12px">只要有 DNS 记录开启代理（橙云）即计入</span></div>';
     b.querySelectorAll('[data-dzhost]').forEach(function(el){
       el.onclick=function(ev){ev.stopPropagation();showDomainsPage(el.dataset.dzid,el.dataset.dzname,el.dataset.dzhost)};
     });
@@ -2621,7 +2626,7 @@ async function renderAssetsPage(){
           '<strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
           '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div>';
       }).join('')+'</div>';
-      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名同时具备 代理 DNS + Origin 规则 + Origin 证书; 🚇 标记表示该子域名出现在某条隧道的 ingress 路由中 (hostname 完全匹配), 点击可直接打开该隧道设置。</div>';
+      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名的 DNS 记录已开启代理（橙云）, 流量经 Cloudflare CDN; 规则 ✓ / 证书 ✓ 只是可选的回源改写与源站证书, 不作为判定门槛; 🚇 标记表示该子域名出现在某条隧道的 ingress 路由中 (hostname 完全匹配), 点击可直接打开该隧道设置。</div>';
       box.innerHTML=h;
       $('p_r').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
       box.querySelectorAll('[data-azone]').forEach(function(el){
@@ -2649,7 +2654,7 @@ async function renderAssetsPage(){
             tpill+
             '<span class="pill '+(fl.rule?'on':'')+'">规则 '+(fl.rule?'✓':'✗')+'</span>'+
             '<span class="pill '+(fl.cert?'on':'')+'">证书 '+(fl.cert?'✓':'✗')+'</span>'+
-            (fl.cdn?'<span class="pill cdn">CF CDN</span>':'');
+            (fl.cdn?'<span class="pill cdn" title="DNS 橙云代理已开启, 流量经 Cloudflare CDN; Origin 规则 '+(fl.rule?'✓':'✗')+' · Origin 证书 '+(fl.cert?'✓':'✗')+' (可选, 不影响 CDN 判定)">CF CDN</span>':'');
           return '<div class="acc-item" style="cursor:pointer" data-shost="'+esc(x)+'">'+
             '<div class="dz-main"><strong style="min-width:0;word-break:break-all">'+esc(x)+'</strong>'+
             '<div class="dz-meta" style="gap:5px">'+tags+'</div></div>'+
