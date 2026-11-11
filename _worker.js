@@ -37,7 +37,7 @@ const CONFIG_DEFAULTS = {
 
 // ============================ 版本信息 ============================
 // 每次发布改动这里: 登录页底部、侧栏底部、GET /api/version 都会显示, 用来确认线上是否已更新
-const APP_VERSION = "2.3.2";
+const APP_VERSION = "2.3.3";
 const BUILD_DATE = "2026-11-11";
 const VERSION_TAG = "v" + APP_VERSION + " · " + BUILD_DATE;
 // ====================================================================
@@ -1003,6 +1003,11 @@ async function handleApi(request, env, path) {
     const h = String(host || "").toLowerCase();
     return h && (e.includes('"' + h + '"') || e.includes("'" + h + "'") || e.includes(h + ".") && !h.includes(".")); // 顶-slot 主域: 行尾如 a.b.com.
   };
+  // Cloudflare Tunnel 的 DNS 记录: CNAME <tunnel-id>.cfargotunnel.com (橙云代理)
+  // 这是 cloudflared 主动反连 CF 边缘, 不是回源到源站的 CDN, 不能算作 CF CDN
+  const isTunnelRecord = (r) =>
+    String(r.type || "").toUpperCase() === "CNAME" &&
+    /(^|\.)cfargotunnel\.com$/i.test(String(r.content || "").replace(/\.$/, "").toLowerCase());
 
   // 隧道 ingress 配置 (列表接口不带 config, 需逐条拉取)
   async function tunnelRoutes(env, base, tunnels) {
@@ -1023,10 +1028,11 @@ async function handleApi(request, env, path) {
     return json({ zones });
   }
 
-  // /api/cdn: 逐个子域名判定 CF CDN (DNS 橙云代理), 再按 Zone 汇总
+  // /api/cdn: 逐个子域名判定 CF CDN (DNS 橙云代理且非 Tunnel 接入), 再按 Zone 汇总
   // 注意: 是否走 CDN 只取决于 DNS 记录是否开启代理 (proxied / 橙云)。
   // Origin Rules 只是可选的回源端口/Host 改写, Origin CA 证书只是可选的源站证书;
   // 直连 VPS 用 A/AAAA + 橙云即可套 CDN, 不需要这两样, 缺它们不代表没走 CDN。
+  // 但 CNAME 指向 cfargotunnel.com 的是 Cloudflare Tunnel (cloudflared 反连边缘), 不算 CDN。
   if (path === "/api/cdn") {
     const zones = await listZones(env);
     const out = new Array(zones.length);
@@ -1062,12 +1068,14 @@ async function handleApi(request, env, path) {
 
         // 按 DNS 主机名聚合: 同一主机名有多条记录时, 只要有一条代理就算代理
         const proxiedByHost = new Map();
+        const tunnelHosts = new Set();
         let proxiedAll = 0;
         for (const r of recs) {
           const h = norm(r.name);
           if (!inZone(h)) continue;
           if (r.proxied === true) proxiedAll++;
           proxiedByHost.set(h, (proxiedByHost.get(h) || false) || r.proxied === true);
+          if (isTunnelRecord(r)) tunnelHosts.add(h);
         }
 
         const hosts = [];
@@ -1075,7 +1083,9 @@ async function handleApi(request, env, path) {
           if (h === zn) continue; // 主域名不算子域名
           const rule = ruleCovers(h);
           const cert = certCovers(certHosts, h);
-          hosts.push({ host: h, dns: true, proxied: !!proxied, rule, cert, cdn: !!proxied, full: !!(proxied && rule && cert) });
+          const tunnel = tunnelHosts.has(h);
+          const cdn = !!proxied && !tunnel; // 橙云代理且非 Tunnel 接入才算 CF CDN
+          hosts.push({ host: h, dns: true, proxied: !!proxied, rule, cert, tunnel, cdn, full: cdn && rule && cert });
         }
         hosts.sort((a, b) => (a.host < b.host ? -1 : a.host > b.host ? 1 : 0));
         const cdnHosts = hosts.filter((x) => x.cdn).map((x) => x.host);
@@ -1131,13 +1141,15 @@ async function handleApi(request, env, path) {
       }
       hosts.delete(zn); // 主域名单独显示
 
-      // 逐个主机名标记: 代理 DNS / Origin 规则 / Origin 证书
-      // CF CDN 只看 DNS 橙云代理; 规则与证书仅作为附加信息展示, 不作为门槛
+      // 逐个主机名标记: 代理 DNS / Origin 规则 / Origin 证书 / Tunnel 接入
+      // CF CDN 只看 DNS 橙云代理且非 Tunnel 接入; 规则与证书仅作为附加信息展示, 不作为门槛
       const proxiedByHost = new Map();
+      const tunnelHosts = new Set();
       for (const r of recs) {
         const h = norm(r.name);
         if (!inZone(h)) continue;
         proxiedByHost.set(h, (proxiedByHost.get(h) || false) || r.proxied === true);
+        if (isTunnelRecord(r)) tunnelHosts.add(h);
       }
       const ruleExprs = rules.rules.map((r) => String(r.expression || "").toLowerCase());
       const ruleCovers = (h) => ruleExprs.some((e) => {
@@ -1167,7 +1179,10 @@ async function handleApi(request, env, path) {
         const rule = ruleCovers(h);
         const cert = certCovers(certHosts, h);
         const tuns = tunnelByHost.get(h) || [];
-        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, cdn: proxied, full: proxied && rule && cert, tunnels: tuns };
+        // CNAME 指向 cfargotunnel.com, 或出现在某条隧道 ingress 路由里 → Tunnel 接入, 不算 CDN
+        const tunnel = tunnelHosts.has(h) || tuns.length > 0;
+        const cdn = proxied && !tunnel;
+        flags[h] = { dns: proxiedByHost.has(h), proxied, rule, cert, tunnel, cdn, full: cdn && rule && cert, tunnels: tuns };
       }
 
       return json({ zone: { id: zone.id, name: zone.name }, hosts: Array.from(hosts).sort(), apex: zone.name, flags });
@@ -1804,6 +1819,7 @@ background:var(--side2);color:var(--sub);font-size:12px;line-height:1;cursor:poi
 .pill.off{color:var(--bad);border-color:rgba(217,63,63,.35)}
 .pill.warn{color:var(--warn);border-color:rgba(232,163,23,.4)}
 .pill.cdn{color:#f6821f;border-color:rgba(246,130,31,.45);background:rgba(246,130,31,.12)}
+.pill.tunnel{color:#5b6ea8;border-color:rgba(91,110,168,.4);background:rgba(91,110,168,.1)}
 .acc-item.dz{align-items:flex-start}
 .acc-item.dz .dz-main{min-width:0;flex:1}
 .dz-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -2595,11 +2611,11 @@ async function loadDashZones(){
       return '<div class="acc-item dz" style="cursor:pointer" data-dzid="'+esc(z.id)+'" data-dzname="'+esc(z.name)+'">'+
         '<div class="dz-main">'+
           '<div class="dz-top"><strong class="dz-name">🌐 '+esc(z.name)+'</strong>'+
-          '<span class="pill '+(z.cdn?'cdn':'off')+'" title="DNS 橙云代理：流量经 Cloudflare CDN；其中 '+(z.fullCount||0)+' 个子域名同时具备 Origin 规则 + Origin 证书">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
+          '<span class="pill '+(z.cdn?'cdn':'off')+'" title="DNS 橙云代理（不含 Tunnel 接入）：流量经 Cloudflare CDN；其中 '+(z.fullCount||0)+' 个子域名同时具备 Origin 规则 + Origin 证书">'+(z.cdn?'CF CDN':'无 CDN')+'</span></div>'+
           subs+
         '</div>'+
         '<span class="btn sm" style="flex:none">管理 →</span></div>';
-    }).join(''):'<div class="empty">暂无命中 CF CDN 的域名<br><span style="font-size:12px">只要有 DNS 记录开启代理（橙云）即计入</span></div>';
+    }).join(''):'<div class="empty">暂无命中 CF CDN 的域名<br><span style="font-size:12px">有非 Tunnel 的 DNS 记录开启代理（橙云）即计入</span></div>';
     b.querySelectorAll('[data-dzhost]').forEach(function(el){
       el.onclick=function(ev){ev.stopPropagation();showDomainsPage(el.dataset.dzid,el.dataset.dzname,el.dataset.dzhost)};
     });
@@ -2626,7 +2642,7 @@ async function renderAssetsPage(){
           '<strong style="font-size:14px">🌐 '+esc(z.name)+'</strong>'+
           '<span style="margin-left:auto" class="btn sm">查看子域名 →</span></div>';
       }).join('')+'</div>';
-      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名的 DNS 记录已开启代理（橙云）, 流量经 Cloudflare CDN; 规则 ✓ / 证书 ✓ 只是可选的回源改写与源站证书, 不作为判定门槛; 🚇 标记表示该子域名出现在某条隧道的 ingress 路由中 (hostname 完全匹配), 点击可直接打开该隧道设置。</div>';
+      h+='<div class="hint" style="margin-top:10px">点击域名进入子域名列表; 子域名来自 DNS 解析 / Origin 规则 / 隧道路由的汇总。橙色 CF CDN 表示该子域名的 DNS 记录已开启代理（橙云）, 流量经 Cloudflare CDN; 规则 ✓ / 证书 ✓ 只是可选的回源改写与源站证书, 不作为判定门槛; 由 Cloudflare Tunnel 接入（CNAME 指向 cfargotunnel.com 或命中隧道路由）的子域名显示蓝色 CF Tunnel, 属 cloudflared 反连边缘、不是 CDN 回源, 不计入 CF CDN; 🚇 标记表示该子域名出现在某条隧道的 ingress 路由中 (hostname 完全匹配), 点击可直接打开该隧道设置。</div>';
       box.innerHTML=h;
       $('p_r').onclick=function(){dmg.zone='';dmg.host='';renderAssetsPage()};
       box.querySelectorAll('[data-azone]').forEach(function(el){
@@ -2654,7 +2670,8 @@ async function renderAssetsPage(){
             tpill+
             '<span class="pill '+(fl.rule?'on':'')+'">规则 '+(fl.rule?'✓':'✗')+'</span>'+
             '<span class="pill '+(fl.cert?'on':'')+'">证书 '+(fl.cert?'✓':'✗')+'</span>'+
-            (fl.cdn?'<span class="pill cdn" title="DNS 橙云代理已开启, 流量经 Cloudflare CDN; Origin 规则 '+(fl.rule?'✓':'✗')+' · Origin 证书 '+(fl.cert?'✓':'✗')+' (可选, 不影响 CDN 判定)">CF CDN</span>':'');
+            (fl.cdn?'<span class="pill cdn" title="DNS 橙云代理已开启, 流量经 Cloudflare CDN; Origin 规则 '+(fl.rule?'✓':'✗')+' · Origin 证书 '+(fl.cert?'✓':'✗')+' (可选, 不影响 CDN 判定)">CF CDN</span>':
+             fl.tunnel?'<span class="pill tunnel" title="由 Cloudflare Tunnel 接入 (cloudflared 反连 CF 边缘), 不是 CDN 回源, 不计入 CF CDN">CF Tunnel</span>':'');
           return '<div class="acc-item" style="cursor:pointer" data-shost="'+esc(x)+'">'+
             '<div class="dz-main"><strong style="min-width:0;word-break:break-all">'+esc(x)+'</strong>'+
             '<div class="dz-meta" style="gap:5px">'+tags+'</div></div>'+
